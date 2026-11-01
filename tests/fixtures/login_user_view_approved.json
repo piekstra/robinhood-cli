@@ -1,0 +1,14 @@
+{
+  "page": null,
+  "context": null,
+  "type": "result",
+  "type_context": {
+    "result": "workflow_status_approved",
+    "result_type": "security.verification-result"
+  },
+  "sequence": 0,
+  "state_name": "Challenge",
+  "prev_state_name": "Challenge",
+  "http_status": null,
+  "locality": "US"
+}

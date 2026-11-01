@@ -1,0 +1,129 @@
+{
+  "results": [
+    {
+      "id": "00000000-0000-4000-8000-0000000000c1",
+      "user_id": "00000000-0000-4000-8000-0000000000f1",
+      "rhs_account_number": 100000001,
+      "contra_account_name": "Sample Owner",
+      "contra_account_number": "SAMPLE99",
+      "contra_broker_name": "Example Securities",
+      "contra_broker_logo": null,
+      "contra_dtcc_number": "0000",
+      "control_number": "00000000000000",
+      "direction": "incoming",
+      "phase": "settled",
+      "reject_reason": "Please [contact customer support](robinhood://contact_support?topic_id=0) to find the best solution forward.",
+      "reject_reason_enum": null,
+      "retry_steps": null,
+      "transfer_type": "full",
+      "requested_at": "2022-12-13T20:00:00.000000+00:00",
+      "last_activity_at": "2022-12-17T07:00:00.000000+00:00",
+      "estimated_settlement_date": "2022-12-16",
+      "settlement_date": "2022-12-20",
+      "cash_advance_grant_date": null,
+      "estimated_cash_advance_grant_date": null,
+      "market_value": null,
+      "bonus_match": null,
+      "gold_deposit_boost": null,
+      "assets": [
+        {
+          "asset_type": "equity",
+          "asset_id": "00000000-0000-4000-8000-0000000000a1",
+          "direction": "long",
+          "quantity": "10.000000",
+          "instrument_id": "00000000-0000-4000-8000-0000000000a1",
+          "iso_currency_code": null
+        },
+        {
+          "asset_type": "equity",
+          "asset_id": "00000000-0000-4000-8000-0000000000a2",
+          "direction": "long",
+          "quantity": "2.000000",
+          "instrument_id": "00000000-0000-4000-8000-0000000000a2",
+          "iso_currency_code": null
+        },
+        {
+          "asset_type": "cash",
+          "asset_id": null,
+          "direction": "long",
+          "quantity": "19.6900",
+          "instrument_id": null,
+          "iso_currency_code": "USD"
+        },
+        {
+          "asset_type": "cash",
+          "asset_id": null,
+          "direction": "short",
+          "quantity": "75.0000",
+          "instrument_id": null,
+          "iso_currency_code": "USD"
+        }
+      ]
+    },
+    {
+      "id": "00000000-0000-4000-8000-0000000000c2",
+      "user_id": "00000000-0000-4000-8000-0000000000f1",
+      "rhs_account_number": 100000001,
+      "contra_account_name": "Sample Owner",
+      "contra_account_number": "SAMPLE99",
+      "contra_broker_name": null,
+      "contra_broker_logo": null,
+      "contra_dtcc_number": "0000",
+      "control_number": "00000000000000",
+      "direction": "incoming",
+      "phase": "settled",
+      "reject_reason": "Please [contact customer support](robinhood://contact_support?topic_id=0) to find the best solution forward.",
+      "reject_reason_enum": null,
+      "retry_steps": null,
+      "transfer_type": "residual",
+      "requested_at": "2022-12-27T11:00:00.000000+00:00",
+      "last_activity_at": "2022-12-28T02:00:00.000000+00:00",
+      "estimated_settlement_date": "2022-12-29",
+      "settlement_date": "2022-12-28",
+      "cash_advance_grant_date": null,
+      "estimated_cash_advance_grant_date": null,
+      "market_value": null,
+      "bonus_match": null,
+      "gold_deposit_boost": null,
+      "assets": [
+        {
+          "asset_type": "cash",
+          "asset_id": null,
+          "direction": "long",
+          "quantity": "2.5700",
+          "instrument_id": null,
+          "iso_currency_code": "USD"
+        }
+      ]
+    },
+    {
+      "id": "00000000-0000-4000-8000-0000000000c3",
+      "user_id": "00000000-0000-4000-8000-0000000000f1",
+      "rhs_account_number": 900000009,
+      "contra_account_name": "Sample Owner",
+      "contra_account_number": "SAMPLE98",
+      "contra_broker_name": "Example Brokerage",
+      "contra_broker_logo": null,
+      "contra_dtcc_number": "0000",
+      "control_number": "00000000000000",
+      "direction": "incoming",
+      "phase": "rejected",
+      "reject_reason": "Please [contact customer support](robinhood://contact_support?topic_id=0) to find the best solution forward.",
+      "reject_reason_enum": null,
+      "retry_steps": null,
+      "transfer_type": "full",
+      "requested_at": "2024-03-01T01:00:00.000000+00:00",
+      "last_activity_at": "2024-03-01T18:00:00.000000+00:00",
+      "estimated_settlement_date": "2024-03-08",
+      "settlement_date": null,
+      "cash_advance_grant_date": null,
+      "estimated_cash_advance_grant_date": null,
+      "market_value": null,
+      "bonus_match": null,
+      "gold_deposit_boost": null,
+      "assets": []
+    }
+  ],
+  "prev": null,
+  "next": null
+}

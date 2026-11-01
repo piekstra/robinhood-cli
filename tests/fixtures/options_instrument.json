@@ -1,0 +1,20 @@
+{
+  "id": "00000000-0000-4000-8000-0000000000a2",
+  "chain_id": "00000000-0000-4000-8000-0000000000c2",
+  "chain_symbol": "TESTF",
+  "created_at": "2026-01-05T02:00:00.000000Z",
+  "expiration_date": "2026-08-21",
+  "issue_date": "2026-01-05",
+  "min_ticks": {
+    "above_tick": "0.05",
+    "below_tick": "0.01",
+    "cutoff_price": "3.00"
+  },
+  "rhs_tradability": "tradable",
+  "state": "active",
+  "strike_price": "45.0000",
+  "tradability": "tradable",
+  "type": "call",
+  "updated_at": "2026-01-05T02:00:00.000000Z",
+  "url": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a2/"
+}

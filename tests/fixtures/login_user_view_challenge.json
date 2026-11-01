@@ -1,0 +1,40 @@
+{
+  "page": "ChallengePage",
+  "context": {
+    "initial_alert": null,
+    "sheriff_flow_id": "login_suv",
+    "fallback_cta_text": "Verify with bank instead",
+    "sheriff_challenge": {
+      "id": "00000000-0000-4000-8000-0000000000f3",
+      "type": "app",
+      "status": "issued",
+      "expires_at": "2026-08-12T12:00:00.000000-05:00",
+      "remaining_retries": 3,
+      "remaining_attempts": 3
+    },
+    "verification_workflow_id": "00000000-0000-4000-8000-0000000000f1"
+  },
+  "type": "page",
+  "type_context": {
+    "context": {
+      "initial_alert": null,
+      "sheriff_flow_id": "login_suv",
+      "fallback_cta_text": "Verify with bank instead",
+      "sheriff_challenge": {
+        "id": "00000000-0000-4000-8000-0000000000f3",
+        "type": "app",
+        "status": "issued",
+        "expires_at": "2026-08-12T12:00:00.000000-05:00",
+        "remaining_retries": 3,
+        "remaining_attempts": 3
+      },
+      "verification_workflow_id": "00000000-0000-4000-8000-0000000000f1"
+    }
+  },
+  "sequence": 0,
+  "state_name": "Challenge",
+  "prev_state_name": "EntryPoint",
+  "polling_interval": null,
+  "http_status": 200,
+  "locality": "US"
+}

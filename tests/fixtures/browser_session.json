@@ -1,0 +1,12 @@
+{
+  "access_token": "SAMPLE-ACCESS-TOKEN-NOT-A-REAL-CREDENTIAL",
+  "expires_in": 86400,
+  "token_type": "Bearer",
+  "scope": "internal",
+  "refresh_token": "SAMPLE-REFRESH-TOKEN-NOT-A-REAL-CREDENTIAL",
+  "read_only_secondary_access_token": "SAMPLE-READONLY-TOKEN-NOT-A-REAL-CREDENTIAL",
+  "mfa_code": null,
+  "backup_code": null,
+  "user_uuid": "00000000-0000-4000-8000-000000000000",
+  "device_token": null
+}

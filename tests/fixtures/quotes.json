@@ -1,0 +1,43 @@
+{
+  "results": [
+    {
+      "ask_price": "155.100000",
+      "ask_size": 100,
+      "bid_price": "154.900000",
+      "bid_size": 200,
+      "last_trade_price": "155.000000",
+      "last_extended_hours_trade_price": "155.250000",
+      "previous_close": "153.000000",
+      "adjusted_previous_close": "153.000000",
+      "previous_close_date": "2026-08-20",
+      "symbol": "SAMPL",
+      "trading_halted": false,
+      "has_traded": true,
+      "last_trade_price_source": "consolidated",
+      "updated_at": "2026-08-21T19:00:00Z",
+      "instrument": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000001/",
+      "instrument_id": "00000000-0000-4000-8000-000000000001",
+      "state": "active"
+    },
+    {
+      "ask_price": "25.760000",
+      "ask_size": 500,
+      "bid_price": "25.740000",
+      "bid_size": 400,
+      "last_trade_price": null,
+      "last_extended_hours_trade_price": "25.750000",
+      "previous_close": "25.500000",
+      "adjusted_previous_close": "25.500000",
+      "previous_close_date": "2026-08-20",
+      "symbol": "TESTF",
+      "trading_halted": false,
+      "has_traded": true,
+      "last_trade_price_source": "consolidated",
+      "updated_at": "2026-08-21T23:30:00Z",
+      "instrument": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000002/",
+      "instrument_id": "00000000-0000-4000-8000-000000000002",
+      "state": "active"
+    },
+    null
+  ]
+}

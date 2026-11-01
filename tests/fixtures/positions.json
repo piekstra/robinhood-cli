@@ -1,0 +1,63 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "url": "https://api.robinhood.com/positions/SAMPLE01/00000000-0000-4000-8000-000000000001/",
+      "instrument": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000001/",
+      "instrument_id": "00000000-0000-4000-8000-000000000001",
+      "account": "https://api.robinhood.com/accounts/SAMPLE01/",
+      "account_number": "SAMPLE01",
+      "average_buy_price": "150.0000",
+      "quantity": "10.00000000",
+      "shares_held_for_buys": "0.00000000",
+      "shares_held_for_sells": "0.00000000",
+      "shares_held_for_stock_grants": "0.00000000",
+      "shares_held_for_options_collateral": "0.00000000",
+      "shares_held_for_options_events": "0.00000000",
+      "intraday_average_buy_price": "0.0000",
+      "intraday_quantity": "0.00000000",
+      "pending_average_buy_price": "150.0000",
+      "created_at": "2024-02-01T15:00:00.000000Z",
+      "updated_at": "2026-08-01T15:00:00.000000Z"
+    },
+    {
+      "url": "https://api.robinhood.com/positions/SAMPLE01/00000000-0000-4000-8000-000000000002/",
+      "instrument": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000002/",
+      "instrument_id": "00000000-0000-4000-8000-000000000002",
+      "account": "https://api.robinhood.com/accounts/SAMPLE01/",
+      "account_number": "SAMPLE01",
+      "average_buy_price": "25.5000",
+      "quantity": "40.00000000",
+      "shares_held_for_buys": "0.00000000",
+      "shares_held_for_sells": "0.00000000",
+      "shares_held_for_stock_grants": "0.00000000",
+      "shares_held_for_options_collateral": "0.00000000",
+      "shares_held_for_options_events": "0.00000000",
+      "intraday_average_buy_price": "0.0000",
+      "intraday_quantity": "0.00000000",
+      "pending_average_buy_price": "25.5000",
+      "created_at": "2025-06-10T15:00:00.000000Z",
+      "updated_at": "2026-08-01T15:00:00.000000Z"
+    },
+    {
+      "url": "https://api.robinhood.com/positions/SAMPLE03/00000000-0000-4000-8000-000000000001/",
+      "instrument": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000001/",
+      "instrument_id": "00000000-0000-4000-8000-000000000001",
+      "account": "https://api.robinhood.com/accounts/SAMPLE03/",
+      "account_number": "SAMPLE03",
+      "average_buy_price": "140.0000",
+      "quantity": "0.50000000",
+      "shares_held_for_buys": "0.00000000",
+      "shares_held_for_sells": "0.00000000",
+      "shares_held_for_stock_grants": "0.00000000",
+      "shares_held_for_options_collateral": "0.00000000",
+      "shares_held_for_options_events": "0.00000000",
+      "intraday_average_buy_price": "0.0000",
+      "intraday_quantity": "0.00000000",
+      "pending_average_buy_price": "140.0000",
+      "created_at": "2025-09-01T15:00:00.000000Z",
+      "updated_at": "2026-08-01T15:00:00.000000Z"
+    }
+  ]
+}

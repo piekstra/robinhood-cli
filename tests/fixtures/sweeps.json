@@ -1,0 +1,36 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": "00000000-0000-4000-8000-000000000040",
+      "account_number": "SAMPLE01",
+      "amount": {
+        "amount": "1.2300",
+        "currency_code": "USD",
+        "currency_id": "00000000-0000-4000-8000-000000000099"
+      },
+      "direction": "credit",
+      "pay_date": "2026-06-30",
+      "pay_period_start": "2026-06-01",
+      "pay_period_end": "2026-06-30",
+      "payout_type": "end_of_month_payment",
+      "reason": "interest_payment"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000041",
+      "account_number": "SAMPLE02",
+      "amount": {
+        "amount": "0.4500",
+        "currency_code": "USD",
+        "currency_id": "00000000-0000-4000-8000-000000000099"
+      },
+      "direction": "credit",
+      "pay_date": "2026-05-31",
+      "pay_period_start": "2026-05-01",
+      "pay_period_end": "2026-05-31",
+      "payout_type": "eom_payment",
+      "reason": "interest_payment"
+    }
+  ]
+}

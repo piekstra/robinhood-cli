@@ -1,0 +1,40 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "url": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000001/",
+      "symbol": "SAMPL",
+      "name": "Sample Industries Inc. Common Stock",
+      "simple_name": "Sample Industries",
+      "type": "stock",
+      "tradeable": true,
+      "state": "active",
+      "country": "US",
+      "list_date": "2001-01-01",
+      "quote": "https://api.robinhood.com/quotes/SAMPL/",
+      "fundamentals": "https://api.robinhood.com/fundamentals/SAMPL/",
+      "splits": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000001/splits/",
+      "market": "https://api.robinhood.com/markets/XNAS/",
+      "tradable_chain_id": "00000000-0000-4000-8000-0000000000c1"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "url": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000002/",
+      "symbol": "TESTF",
+      "name": "Test Fund ETF",
+      "simple_name": "Test Fund",
+      "type": "etp",
+      "tradeable": true,
+      "state": "active",
+      "country": "US",
+      "list_date": "2010-01-01",
+      "quote": "https://api.robinhood.com/quotes/TESTF/",
+      "fundamentals": "https://api.robinhood.com/fundamentals/TESTF/",
+      "splits": "https://api.robinhood.com/instruments/00000000-0000-4000-8000-000000000002/splits/",
+      "market": "https://api.robinhood.com/markets/ARCX/",
+      "tradable_chain_id": null
+    }
+  ]
+}

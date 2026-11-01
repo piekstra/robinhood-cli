@@ -1,0 +1,18 @@
+{
+  "detail": "Request blocked, prompt challenge issued.",
+  "challenge": {
+    "id": "00000000-0000-4000-8000-0000000000f4",
+    "user": "00000000-0000-4000-8000-000000000000",
+    "type": "prompt",
+    "alternate_type": "sms",
+    "status": "issued",
+    "remaining_retries": 3,
+    "remaining_attempts": 1,
+    "expires_at": "2026-08-12T12:00:00.000000-05:00",
+    "updated_at": "2026-08-12T11:55:00.000000-05:00",
+    "flow_id": "login",
+    "mfa_status": "prompt",
+    "silent": false,
+    "silent_factor_id": null
+  }
+}

@@ -1,0 +1,44 @@
+[package]
+name = "robinhood-cli"
+description = "Read-only CLI for Robinhood brokerage accounts (piekstra-cli/1). Unofficial, community-documented API."
+version = "0.2.0"
+edition = "2021"
+# pk-cli-browser (tungstenite 0.30) needs 1.85.
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/piekstra/robinhood-cli"
+homepage = "https://github.com/piekstra/robinhood-cli"
+authors = ["piekstra"]
+publish = false
+
+[[bin]]
+name = "rhd"
+path = "src/main.rs"
+
+[dependencies]
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0", features = ["reqwest"] }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-documents = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+pk-cli-browser = { git = "https://github.com/piekstra/cli-common", tag = "v0.9.0" }
+
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps JSON object key order at insertion order, which is what
+# SPEC v1 §1.4 promises for both `output::kv` blocks and `table_view` columns.
+serde_json = { version = "1", features = ["preserve_order"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"

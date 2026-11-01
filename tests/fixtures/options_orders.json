@@ -1,0 +1,199 @@
+{
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": "00000000-0000-4000-8000-000000000050",
+      "ref_id": "00000000-0000-4000-8000-000000000058",
+      "account_number": "SAMPLE01",
+      "cancel_url": null,
+      "canceled_quantity": "0.00000",
+      "chain_id": "00000000-0000-4000-8000-0000000000c1",
+      "chain_symbol": "SAMPL",
+      "closing_strategy": null,
+      "created_at": "2026-06-01T14:00:00.000000Z",
+      "direction": "credit",
+      "legs": [
+        {
+          "id": "00000000-0000-4000-8000-000000000051",
+          "option": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a1/",
+          "position_effect": "open",
+          "ratio_quantity": 1,
+          "side": "sell",
+          "option_type": "call",
+          "strike_price": "150.0000",
+          "expiration_date": "2026-07-17",
+          "executions": [
+            {
+              "id": "00000000-0000-4000-8000-0000000000e5",
+              "price": "1.50000000",
+              "quantity": "1.00000",
+              "settlement_date": "2026-06-02",
+              "timestamp": "2026-06-01T14:00:05.100000Z"
+            }
+          ]
+        }
+      ],
+      "opening_strategy": "short_call",
+      "pending_quantity": "0.00000",
+      "premium": "150.00000000",
+      "price": "1.50000000",
+      "processed_premium": "150.00000000",
+      "processed_quantity": "1.00000",
+      "quantity": "1.00000",
+      "response_category": null,
+      "state": "filled",
+      "stop_price": null,
+      "time_in_force": "gfd",
+      "trigger": "immediate",
+      "type": "limit",
+      "updated_at": "2026-06-01T14:00:05.000000Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000052",
+      "ref_id": "00000000-0000-4000-8000-000000000059",
+      "account_number": "SAMPLE01",
+      "cancel_url": null,
+      "canceled_quantity": "0.00000",
+      "chain_id": "00000000-0000-4000-8000-0000000000c1",
+      "chain_symbol": "SAMPL",
+      "closing_strategy": "short_call",
+      "created_at": "2026-06-20T15:30:00.000000Z",
+      "direction": "debit",
+      "legs": [
+        {
+          "id": "00000000-0000-4000-8000-000000000053",
+          "option": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a1/",
+          "position_effect": "close",
+          "ratio_quantity": 1,
+          "side": "buy",
+          "option_type": "call",
+          "strike_price": "150.0000",
+          "expiration_date": "2026-07-17",
+          "executions": [
+            {
+              "id": "00000000-0000-4000-8000-0000000000e6",
+              "price": "0.80000000",
+              "quantity": "1.00000",
+              "settlement_date": "2026-06-23",
+              "timestamp": "2026-06-20T15:30:02.500000Z"
+            }
+          ]
+        }
+      ],
+      "opening_strategy": null,
+      "pending_quantity": "0.00000",
+      "premium": "80.00000000",
+      "price": "0.80000000",
+      "processed_premium": "80.00000000",
+      "processed_quantity": "1.00000",
+      "quantity": "1.00000",
+      "response_category": null,
+      "state": "filled",
+      "stop_price": null,
+      "time_in_force": "gfd",
+      "trigger": "immediate",
+      "type": "limit",
+      "updated_at": "2026-06-20T15:30:03.000000Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000054",
+      "ref_id": "00000000-0000-4000-8000-000000000060",
+      "account_number": "SAMPLE01",
+      "cancel_url": null,
+      "canceled_quantity": "0.00000",
+      "chain_id": "00000000-0000-4000-8000-0000000000c2",
+      "chain_symbol": "TESTF",
+      "closing_strategy": null,
+      "created_at": "2026-07-10T13:45:00.000000Z",
+      "direction": "credit",
+      "legs": [
+        {
+          "id": "00000000-0000-4000-8000-000000000055",
+          "option": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a2/",
+          "position_effect": "open",
+          "ratio_quantity": 1,
+          "side": "sell",
+          "executions": [
+            {
+              "id": "00000000-0000-4000-8000-0000000000e7",
+              "price": "2.00000000",
+              "quantity": "2.00000",
+              "settlement_date": "2026-07-13",
+              "timestamp": "2026-07-10T13:45:01.200000Z"
+            }
+          ]
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000056",
+          "option": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a3/",
+          "position_effect": "open",
+          "ratio_quantity": 1,
+          "side": "buy",
+          "executions": [
+            {
+              "id": "00000000-0000-4000-8000-0000000000e8",
+              "price": "1.10000000",
+              "quantity": "2.00000",
+              "settlement_date": "2026-07-13",
+              "timestamp": "2026-07-10T13:45:01.400000Z"
+            }
+          ]
+        }
+      ],
+      "opening_strategy": "short_call_spread",
+      "pending_quantity": "0.00000",
+      "premium": "180.00000000",
+      "price": "0.90000000",
+      "processed_premium": "180.00000000",
+      "processed_quantity": "2.00000",
+      "quantity": "2.00000",
+      "response_category": null,
+      "state": "filled",
+      "stop_price": null,
+      "time_in_force": "gfd",
+      "trigger": "immediate",
+      "type": "limit",
+      "updated_at": "2026-07-10T13:45:02.000000Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000057",
+      "ref_id": "00000000-0000-4000-8000-000000000061",
+      "account_number": "SAMPLE01",
+      "cancel_url": null,
+      "canceled_quantity": "1.00000",
+      "chain_id": "00000000-0000-4000-8000-0000000000c1",
+      "chain_symbol": "SAMPL",
+      "closing_strategy": null,
+      "created_at": "2026-08-03T14:10:00.000000Z",
+      "direction": "debit",
+      "legs": [
+        {
+          "id": "00000000-0000-4000-8000-000000000062",
+          "option": "https://api.robinhood.com/options/instruments/00000000-0000-4000-8000-0000000000a1/",
+          "position_effect": "open",
+          "ratio_quantity": 1,
+          "side": "buy",
+          "option_type": "call",
+          "strike_price": "150.0000",
+          "expiration_date": "2026-09-18",
+          "executions": []
+        }
+      ],
+      "opening_strategy": "long_call",
+      "pending_quantity": "0.00000",
+      "premium": "120.00000000",
+      "price": "1.20000000",
+      "processed_premium": "0.00",
+      "processed_quantity": "0.00000",
+      "quantity": "1.00000",
+      "response_category": null,
+      "state": "cancelled",
+      "stop_price": null,
+      "time_in_force": "gtc",
+      "trigger": "immediate",
+      "type": "limit",
+      "updated_at": "2026-08-03T18:00:00.000000Z"
+    }
+  ]
+}

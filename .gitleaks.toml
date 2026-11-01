@@ -1,0 +1,11 @@
+# gitleaks configuration for robinhood-cli.
+#
+# This tool hardcodes no secrets. The account password, OAuth access/refresh
+# tokens, the device token, and any parked mid-challenge login state exist only
+# in the OS keychain at runtime; test fixtures are synthetic and carry no real
+# values (see tests/fixtures/README.md). So we extend the default ruleset with
+# no allowlisted secrets. If gitleaks flags something, it's a real finding:
+# remove it, don't allowlist it.
+
+[extend]
+useDefault = true
