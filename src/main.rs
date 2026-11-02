@@ -14,6 +14,7 @@ mod client;
 mod commands;
 mod config;
 mod fixed;
+mod mcp;
 
 use std::path::PathBuf;
 
@@ -124,6 +125,12 @@ enum Command {
     Completions { shell: Shell },
     /// Machine-readable capability discovery (cli-info/v1).
     Info,
+    /// Serve read-only Robinhood tools to Claude over MCP (stdio).
+    ///
+    /// For Claude Code (`claude mcp add robinhood -- rhd mcp`), Claude
+    /// Desktop and any MCP client. The tools use the selected profile's
+    /// session from `rhd auth login --browser`, and never sign in themselves.
+    Mcp(pk_cli_mcp::McpArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -503,6 +510,16 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             return Ok(());
         }
         Command::Info => return commands::misc::info(cli.common.json),
+        Command::Mcp(args) if args.list_tools => {
+            // The definitions need no config, profile or session; building
+            // a context reads nothing.
+            let ctx =
+                commands::Ctx::new(cli.common.clone(), Config::default(), String::new(), None)?;
+            return pk_cli_mcp::run(
+                args,
+                mcp::RobinhoodTools::new(mcp::LiveSource::new(ctx), Ok(String::new())),
+            );
+        }
         Command::SelfUpdate(args) => {
             return Updater {
                 repo: REPO.into(),
@@ -534,6 +551,18 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Config(cmd) => config_cmd(cli, cmd, &store, cfg),
         Command::Profiles(cmd) => profiles_cmd(cli, cmd, &store, cfg),
         Command::Auth(cmd) => auth_cmd(cli, cmd, &store, cfg),
+        Command::Mcp(args) => {
+            // The tools take an `account` argument, so -a/RHD_ACCOUNT is not
+            // passed on. A profile that cannot be chosen fails each call
+            // rather than the server's start.
+            let profile = cfg.require_profile(cli.profile.as_deref());
+            let name = profile.as_deref().unwrap_or_default().to_string();
+            let ctx = commands::Ctx::new(cli.common.clone(), cfg, name, None)?;
+            pk_cli_mcp::run(
+                args,
+                mcp::RobinhoodTools::new(mcp::LiveSource::new(ctx), profile),
+            )
+        }
         _ => {
             // Everything below reads the provider, so it needs a resolved
             // profile and a session.
@@ -606,7 +635,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 | Command::Config(_)
                 | Command::SelfUpdate(_)
                 | Command::Completions { .. }
-                | Command::Info => unreachable!("dispatched before session setup"),
+                | Command::Info
+                | Command::Mcp(_) => unreachable!("dispatched before session setup"),
             }
         }
     }

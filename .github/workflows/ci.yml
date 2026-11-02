@@ -50,6 +50,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
       - run: cargo build --release
+      - run: ./target/release/rhd mcp --list-tools > /dev/null
 
   security:
     name: audit / deny / secrets

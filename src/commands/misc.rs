@@ -30,6 +30,7 @@ pub fn info(json_mode: bool) -> Result<(), CliError> {
             "net-worth",
             "documents",
             "api",
+            "mcp",
         ],
     )
     .with_profiles(&[pk_cli_documents::PROFILE]);

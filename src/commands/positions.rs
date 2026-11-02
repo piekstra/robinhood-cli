@@ -39,7 +39,7 @@ pub struct Position {
 }
 
 impl Position {
-    fn from_json(v: &Value, symbols: &HashMap<String, String>) -> Option<Self> {
+    pub(crate) fn from_json(v: &Value, symbols: &HashMap<String, String>) -> Option<Self> {
         let quantity = str_at(v, "quantity")?;
         let instrument = str_at(v, "instrument");
         let symbol = instrument

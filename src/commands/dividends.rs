@@ -54,7 +54,7 @@ pub struct Dividend {
 }
 
 impl Dividend {
-    fn from_json(v: &Value, symbols: &HashMap<String, String>) -> Option<Self> {
+    pub(crate) fn from_json(v: &Value, symbols: &HashMap<String, String>) -> Option<Self> {
         let id = str_at(v, "id")?;
         Some(Dividend {
             id,
@@ -109,7 +109,7 @@ pub fn list(ctx: &Ctx, range: &RangeArgs) -> Result<(), CliError> {
 }
 
 /// Whether a dividend's payment date falls inside the requested range.
-fn within(row: &Value, since: Option<&str>, until: Option<&str>) -> bool {
+pub(crate) fn within(row: &Value, since: Option<&str>, until: Option<&str>) -> bool {
     match dividend_date(row) {
         Some(d) => crate::commands::date_within(&d, since, until),
         // Undated rows are kept rather than silently dropped — losing a

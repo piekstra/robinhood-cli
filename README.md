@@ -176,6 +176,7 @@ rhd interest list [--since D] [--until D]      # 1099-INT raw material
 rhd documents list|download               # tax forms & statements
 rhd api GET <PATH|URL>                    # raw read-only passthrough (a full
                                           # https://bonfire.robinhood.com/... URL reaches the second host)
+rhd mcp                                   # serve read-only tools to Claude (see Use with Claude)
 rhd self-update | completions <shell> | info
 ```
 
@@ -242,6 +243,65 @@ $ rhd net-worth --json
 
 Downloads are verified by magic bytes: if the payload does not begin with
 `%PDF`, `rhd` fails rather than writing a file and claiming success.
+
+## Use with Claude
+
+`rhd mcp` serves three read-only tools over MCP, so Claude can answer
+questions about your own Robinhood accounts. There is no hosted service: the
+tools run on your computer, in your copy of `rhd`, and call Robinhood's API
+directly with the session `rhd auth login --browser` stored in your OS
+keychain.
+
+| Tool | Answers |
+| --- | --- |
+| `robinhood_portfolio` | What am I worth at Robinhood, and what do I hold? The `net-worth` valuation (cash plus stocks/ETFs at last trade), each account's total, and the positions, narrowed by `account` (its name) or `symbol` |
+| `robinhood_activity` | What happened over a period? Executed stock trades (partial fills on cancelled orders included), dividends and cash-sweep interest by `since`/`until` dates (year to date by default), `account`, `type` (`trade`, `dividend`, `interest`) and `symbol` |
+| `robinhood_documents` | Which tax forms and statements exist? Listed by `type` (`1099`, `account_statement`, `trade_confirm`) and `since`/`until`; never downloaded (`rhd documents download` does that) |
+
+Options, crypto and realized gains are not served: `rhd` values neither
+options nor crypto in its net worth, and Robinhood has no realized-gain
+endpoint (the order history is the raw material; see [Tax use](#tax-use)).
+
+Results are concise by default (`response_format: "detailed"` adds ids,
+prices and fees), 25 records a page with a cursor for more, and never larger
+than about 32,000 characters. Accounts are named by nickname or kind
+(`ira_roth`), with the number's last four characters when two would share a
+name. Descriptions come from Robinhood and other parties; the server tells
+Claude to treat them as data, not instructions.
+
+**Sign in first.** Robinhood sign-in is through a browser, so no settings
+form can hold it. Install `rhd` and run `rhd auth login --browser` in a
+terminal (see [Getting started](#getting-started)). Both ways of connecting
+Claude below then use that session from the OS keychain (service
+`piekstra.rhd`), and refresh it in place as the commands do. If the session
+is missing or has lapsed, the tools say so and ask you to run
+`rhd auth login --browser --profile <NAME>` in a terminal; they never sign in
+by themselves. With several login profiles the server uses the default one
+(`rhd profiles use <NAME>`), or the one named by `rhd mcp --profile <NAME>`.
+
+**Claude Code.** Add the `robinhood-cli` plugin from the
+[piekstra plugin marketplace](https://github.com/piekstra/claude-plugins):
+
+```console
+$ claude plugin marketplace add piekstra/claude-plugins
+$ claude plugin install robinhood-cli@piekstra-plugins
+```
+
+or register the server yourself:
+
+```console
+$ claude mcp add robinhood -- rhd mcp
+```
+
+**Claude Desktop.** Download `rhd-<version>.mcpb` from the
+[latest release](https://github.com/piekstra/robinhood-cli/releases/latest)
+and open it. It asks for nothing: the bundled `rhd` reads the session your
+installed `rhd` stored, for the default profile. On macOS the bundled binary
+is a different program to the keychain, so its first call raises a keychain
+prompt for the `piekstra.rhd` item; choose **Always Allow**, or every call
+will ask again.
+
+Any other MCP client that launches a local server can run `rhd mcp`.
 
 ## Security
 

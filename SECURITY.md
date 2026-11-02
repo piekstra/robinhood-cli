@@ -57,6 +57,18 @@ an issue, a log, or a commit.
   no third-party services.
 - It hardcodes no secrets. `gitleaks` runs in CI over the full history.
 
+## The MCP server
+
+`rhd mcp` serves read-only tools to an MCP client (Claude Code, Claude
+Desktop) over stdio, on this machine only; it opens no port. It uses the
+selected profile's session already in the keychain, exactly as the commands
+do, refreshing it in place, and never signs in: a missing or lapsed session
+is an error asking the user to run `rhd auth login --browser --profile
+<NAME>` in a terminal. No tool downloads a document or emits a download
+link. The Claude Desktop extension (`.mcpb`) takes no settings and so holds
+no credential of its own; on macOS its bundled binary needs the user's
+approval, once, to read the `piekstra.rhd` keychain item.
+
 ## Unofficial-API risk
 
 Robinhood publishes no public retail API and its terms discourage automated
