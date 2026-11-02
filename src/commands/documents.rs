@@ -34,7 +34,7 @@ pub const PATH: &str = "/documents/";
 pub const TYPE_1099: &str = "1099";
 
 /// Map a provider document onto the profile DTO.
-fn to_document(v: &Value) -> Option<Document> {
+pub(crate) fn to_document(v: &Value) -> Option<Document> {
     let id = str_at(v, "id")?;
     let kind = str_at(v, "type");
     let date = str_at(v, "date");
@@ -141,7 +141,7 @@ fn fetch(ctx: &Ctx, range: &RangeArgs, kind: Option<&str>) -> Result<Vec<Documen
 }
 
 /// The date-range rule `list` and `download --all` share.
-fn date_in_range(date: Option<&str>, range: &RangeArgs) -> bool {
+pub(crate) fn date_in_range(date: Option<&str>, range: &RangeArgs) -> bool {
     match date {
         Some(date) => {
             crate::commands::date_within(date, range.since.as_deref(), range.until.as_deref())

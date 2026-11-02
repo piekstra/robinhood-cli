@@ -62,6 +62,7 @@ const GROUPS: &[&str] = &[
     "self-update",
     "completions",
     "info",
+    "mcp",
 ];
 
 #[test]
@@ -165,6 +166,7 @@ fn info_emits_cli_info_dto() {
         "net-worth",
         "documents",
         "api",
+        "mcp",
     ] {
         assert!(
             caps.iter().any(|c| c == expected),

@@ -42,7 +42,7 @@ const QUOTE_BATCH: usize = 25;
 /// truthful** (2026-08-21: distinct row counts per account, each row naming
 /// its own account) — unlike the portfolio endpoints' parameter, which is
 /// ignored (docs/api.md §3.8).
-fn positions_query(account_number: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn positions_query(account_number: &str) -> Vec<(&'static str, String)> {
     vec![
         ("nonzero", "true".to_string()),
         ("account_number", account_number.to_string()),
@@ -94,7 +94,7 @@ pub struct AccountRow {
 
 /// One verified holding, ready to price.
 #[derive(Debug, PartialEq)]
-struct Holding {
+pub(crate) struct Holding {
     /// Quantity in 1/10⁸ units (fractional shares are real).
     quantity: i64,
     /// The instrument UUID — the join key to its quote.
@@ -185,7 +185,7 @@ fn scoped(
 /// failing. Rows that cannot be verified (no account_number) or valued (no
 /// quantity/instrument) are refusals too, never silent omissions that would
 /// understate the account. Pure, so all of it is pinned offline.
-fn verified_holdings(rows: &[Value], number: &str) -> Result<Vec<Holding>, CliError> {
+pub(crate) fn verified_holdings(rows: &[Value], number: &str) -> Result<Vec<Holding>, CliError> {
     rows.iter()
         .map(|r| {
             let owner = str_at(r, "account_number").ok_or_else(|| {
@@ -232,7 +232,7 @@ fn verified_holdings(rows: &[Value], number: &str) -> Result<Vec<Holding>, CliEr
 /// A quotes envelope without a `results` array is a shape surprise and is
 /// named as such — degrading it into per-holding "no quote" errors would
 /// hide the real cause from the user.
-fn fetch_prices(
+pub(crate) fn fetch_prices(
     ctx: &Ctx,
     token: &str,
     instruments: &BTreeSet<String>,
@@ -273,7 +273,7 @@ fn fetch_prices(
 /// instruments) and rows without a resolvable price never enter the map —
 /// the absence then surfaces as [`holdings_value`]'s loud per-holding
 /// error, not a silent $0.
-fn price_map(rows: &[Value]) -> HashMap<String, i64> {
+pub(crate) fn price_map(rows: &[Value]) -> HashMap<String, i64> {
     let mut prices = HashMap::new();
     for q in rows {
         let key = str_at(q, "instrument_id")
@@ -302,7 +302,7 @@ fn quote_price(quote: &Value) -> Option<i64> {
 /// A holding without a price is a **refusal** — omitting it would silently
 /// understate the account, which is the exact failure this command exists
 /// to avoid.
-fn holdings_value(
+pub(crate) fn holdings_value(
     number: &str,
     holdings: &[Holding],
     prices: &HashMap<String, i64>,
@@ -337,7 +337,7 @@ fn holdings_value(
 /// from the account's **own** row, which makes it inherently per-account —
 /// unlike the portfolio endpoints (docs/api.md §3.8). Its absence is a loud
 /// shape-change error, never a $0 assumption.
-fn account_row(
+pub(crate) fn account_row(
     account: &Value,
     number: &str,
     holdings_value: i64,
@@ -379,7 +379,7 @@ fn account_row(
 /// standing positive; an account whose whole equity is negative (a margin
 /// call scenario) lands in `liabilities` instead of silently shrinking
 /// "assets".
-fn rollup(accounts: Vec<(AccountRow, i64)>) -> NetWorth {
+pub(crate) fn rollup(accounts: Vec<(AccountRow, i64)>) -> NetWorth {
     let mut assets: i128 = 0;
     let mut liabilities: i128 = 0;
     for (_, equity) in &accounts {

@@ -144,7 +144,11 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    fn from_json(v: &Value, symbols: &HashMap<String, String>, executions: bool) -> Option<Self> {
+    pub(crate) fn from_json(
+        v: &Value,
+        symbols: &HashMap<String, String>,
+        executions: bool,
+    ) -> Option<Self> {
         let id = str_at(v, "id")?;
         Some(Transaction {
             id,
@@ -235,7 +239,7 @@ pub fn list(
 ///
 /// Without `account_numbers` both feeds answer for the login's **default**
 /// account only (docs/api.md §3.4) — never "every account".
-fn order_query(account: Option<&str>, range: &RangeArgs) -> Vec<(&'static str, String)> {
+pub(crate) fn order_query(account: Option<&str>, range: &RangeArgs) -> Vec<(&'static str, String)> {
     let mut query: Vec<(&'static str, String)> = Vec::new();
     if let Some(acct) = account {
         query.push(("account_numbers", acct.to_string()));
@@ -279,7 +283,7 @@ fn keep_sorted<'a>(
 
 /// Execution date, falling back to placement date — the same precedence
 /// `from_json` uses for the DTO's `date`.
-fn order_date(row: &Value) -> Option<String> {
+pub(crate) fn order_date(row: &Value) -> Option<String> {
     date_of(row, "last_transaction_at").or_else(|| date_of(row, "created_at"))
 }
 

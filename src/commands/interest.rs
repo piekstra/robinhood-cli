@@ -44,7 +44,7 @@ pub struct Interest {
 }
 
 impl Interest {
-    fn from_json(v: &Value) -> Option<Self> {
+    pub(crate) fn from_json(v: &Value) -> Option<Self> {
         let id = str_at(v, "id")?;
         Some(Interest {
             id,
@@ -83,7 +83,7 @@ pub fn list(ctx: &Ctx, range: &RangeArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn within(row: &Value, since: Option<&str>, until: Option<&str>) -> bool {
+pub(crate) fn within(row: &Value, since: Option<&str>, until: Option<&str>) -> bool {
     match str_at(row, "pay_date") {
         Some(d) => crate::commands::date_within(&d, since, until),
         // Undated rows are kept rather than silently dropped.

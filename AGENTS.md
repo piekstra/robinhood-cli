@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.9.0"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.12.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -76,9 +76,12 @@ scrubbed fixture of the expression's answer.
 | `src/commands/*.rs` | one module per command group; a group's subcommand may take its own module once the group's file grows large (`option_events.rs` serves `transactions option-events`), and readers several groups share sit in their own module (`instruments.rs`, `option_instruments.rs`) rather than inside one group |
 | `src/commands/fanout.rs` | the `--all-accounts` per-account read shared by positions, options and transactions: one scoped read per account, every row verified against it (exit 5 on a misattributed or unattributable row), and the account tagging (docs/api.md §3.14) |
 | `src/commands/transfers.rs` | `rhd transfers acats` — the bonfire ACATS listing, joined to accounts through `rhs_account_number` (docs/api.md §3.13) |
+| `src/mcp.rs` | `rhd mcp`: the MCP tools, over the commands' own mappers (see "MCP tools") |
 | `src/fixed.rs` | decimal amounts without floats: display trimming and 8-digit fixed-point arithmetic |
 | `tests/cli_surface.rs` | black-box `assert_cmd` surface tests |
 | `tests/fixture_shapes.rs` | contract tests over `tests/fixtures/` |
+| `tests/mcp_stdio.rs`, `tests/packaging.rs` | `rhd mcp` over stdio, and the `.mcpb` manifest against the binary |
+| `packaging/mcpb/manifest.json` | the Claude Desktop extension's manifest |
 | `docs/api.md` | the API as we understand it, **and the traps** |
 
 ## The two kinds of "account" — do not conflate
@@ -95,6 +98,34 @@ Note the word "profile" is overloaded: `cli-common` uses it for domain
 vocabularies (`documents/v1`), which `info --json` reports under `profiles`.
 This repo's login profiles are reported by `rhd profiles list --json` under
 `login-profile-list/v1`. Different DTOs; keep them straight.
+
+## MCP tools
+
+`rhd mcp` (src/mcp.rs) serves three read-only tools under cli-common's MCP
+profile (DESIGN.md §1.9): `robinhood_portfolio` (the `net-worth` valuation
+and its positions), `robinhood_activity` (executed stock trades, dividends
+and cash interest) and `robinhood_documents` (listed, never downloaded).
+Options, crypto and realized gains are deliberately absent: `net-worth` does
+not value the first two, and there is no realized-gain endpoint. The tools
+read through the `Source` trait at the level of raw rows, and map them with
+the commands' own `from_json`, `verified_holdings`, `account_row` and
+`rollup`, so a tool and its command cannot disagree. `LiveSource` holds one
+`Ctx` and makes one read at a time, because a refresh rotates the stored
+refresh token and two refreshing at once would present the same one twice.
+The tools never sign in: an auth error asks the user to run
+`rhd auth login --browser --profile <NAME>` in a terminal. A profile that
+cannot be chosen (several, no default) fails each call, not the server.
+
+- Tests: `src/mcp/tests.rs` runs every tool in process over the fixtures
+  through a fixture `Source` and cli-common's conformance helper;
+  `tests/mcp_stdio.rs` drives the binary over stdio without reading the
+  keychain; `tests/packaging.rs` holds `packaging/mcpb/manifest.json` to the
+  binary.
+- Budget: the three definitions stay under 8,000 characters together
+  (`the_definitions_stay_small` prints each size). Shorten a description
+  before adding a field.
+- Releases attach `rhd-<version>.mcpb`, a Claude Desktop extension with no
+  settings: it reads the keychain session of the default profile.
 
 ## Non-negotiables
 
