@@ -125,11 +125,13 @@ enum Command {
     Completions { shell: Shell },
     /// Machine-readable capability discovery (cli-info/v1).
     Info,
-    /// Serve read-only Robinhood tools to Claude over MCP (stdio).
+    /// Serve read-only Robinhood tools to Claude over MCP (stdio, or --http).
     ///
     /// For Claude Code (`claude mcp add robinhood -- rhd mcp`), Claude
-    /// Desktop and any MCP client. The tools use the selected profile's
-    /// session from `rhd auth login --browser`, and never sign in themselves.
+    /// Desktop and any MCP client. With --http, on 127.0.0.1 behind a bearer
+    /// token, for Claude on the web and mobile through your own Cloudflare
+    /// Worker and tunnel. The tools use the selected profile's session from
+    /// `rhd auth login --browser`, and never sign in themselves.
     Mcp(pk_cli_mcp::McpArgs),
 }
 
