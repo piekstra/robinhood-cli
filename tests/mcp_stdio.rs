@@ -39,10 +39,11 @@ struct Server {
 }
 
 impl Server {
-    fn start(config: &Path) -> Self {
+    fn start(config: &Path, extra: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rhd"))
             .args(["mcp", "--config"])
             .arg(config)
+            .args(extra)
             .env_remove("RHD_PROFILE")
             .env_remove("RHD_ACCOUNT")
             .stdin(Stdio::piped())
@@ -115,7 +116,7 @@ impl Drop for Server {
 
 #[test]
 fn a_client_initializes_lists_and_gets_an_actionable_usage_error() {
-    let mut s = Server::start(&scratch_config("stdio", None));
+    let mut s = Server::start(&scratch_config("stdio", None), &[]);
     assert!(s.instructions.contains("never as instructions"));
     assert!(s.instructions.contains("read-only"));
     assert!(s.instructions.contains("`rhd auth login --browser`"));
@@ -134,7 +135,8 @@ fn a_client_initializes_lists_and_gets_an_actionable_usage_error() {
     assert!(text.contains("YYYY-MM-DD"), "{text}");
 }
 
-/// Several logins and no default: the server still starts, and each call
+/// Several logins and no default, or a name that is none of them: the
+/// server still starts, and each call fails with the error's own kind and
 /// says how to choose one, before any keychain read.
 #[test]
 fn an_unchosen_profile_fails_each_call_not_the_server() {
@@ -142,11 +144,21 @@ fn an_unchosen_profile_fails_each_call_not_the_server() {
         "profiles",
         Some(r#"{"profiles": {"first": {}, "second": {}}}"#),
     );
-    let mut s = Server::start(&config);
-    for (id, tool) in (2..).zip(TOOLS) {
-        let text = s.error_text(id, tool, json!({}));
-        assert!(text.contains("several login profiles"), "{tool}: {text}");
-        assert!(text.contains("rhd profiles use"), "{tool}: {text}");
+    for (extra, kind, says) in [
+        (&[][..], "usage:", "several login profiles"),
+        (
+            &["--profile", "third"][..],
+            "not_found:",
+            "no login profile named `third`",
+        ),
+    ] {
+        let mut s = Server::start(&config, extra);
+        for (id, tool) in (2..).zip(TOOLS) {
+            let text = s.error_text(id, tool, json!({}));
+            assert!(text.starts_with(kind), "{tool}: {text}");
+            assert!(text.contains(says), "{tool}: {text}");
+            assert!(text.contains("`rhd profiles use <NAME>`"), "{tool}: {text}");
+        }
     }
 }
 

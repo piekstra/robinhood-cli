@@ -517,7 +517,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 commands::Ctx::new(cli.common.clone(), Config::default(), String::new(), None)?;
             return pk_cli_mcp::run(
                 args,
-                mcp::RobinhoodTools::new(mcp::LiveSource::new(ctx), ""),
+                mcp::RobinhoodTools::new(mcp::LiveSource::new(ctx), Ok(String::new())),
             );
         }
         Command::SelfUpdate(args) => {
@@ -555,19 +555,13 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             // The tools take an `account` argument, so -a/RHD_ACCOUNT is not
             // passed on. A profile that cannot be chosen fails each call
             // rather than the server's start.
-            let (profile, unusable) = match cfg.require_profile(cli.profile.as_deref()) {
-                Ok(p) => (p, None),
-                Err(e) => (String::new(), Some(e)),
-            };
-            let ctx = commands::Ctx::new(cli.common.clone(), cfg, profile.clone(), None)?;
-            let source = match unusable {
-                None => mcp::LiveSource::new(ctx),
-                Some(CliError::Usage(m) | CliError::NotFound(m)) | Some(CliError::Other(m)) => {
-                    mcp::LiveSource::unusable(ctx, m)
-                }
-                Some(e) => return Err(e),
-            };
-            pk_cli_mcp::run(args, mcp::RobinhoodTools::new(source, profile))
+            let profile = cfg.require_profile(cli.profile.as_deref());
+            let name = profile.as_deref().unwrap_or_default().to_string();
+            let ctx = commands::Ctx::new(cli.common.clone(), cfg, name, None)?;
+            pk_cli_mcp::run(
+                args,
+                mcp::RobinhoodTools::new(mcp::LiveSource::new(ctx), profile),
+            )
         }
         _ => {
             // Everything below reads the provider, so it needs a resolved

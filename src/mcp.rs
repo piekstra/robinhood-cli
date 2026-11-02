@@ -20,7 +20,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
-use pk_cli_core::{dates, CliError, RangeArgs};
+use pk_cli_core::dates::{self, Civil};
+use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_mcp::{
     parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
 };
@@ -78,34 +79,16 @@ pub trait Source {
 /// shared client also keeps its request pacing across calls.
 pub struct LiveSource {
     ctx: Mutex<Ctx>,
-    /// Why no profile could be chosen, when none could: every call fails
-    /// with it, so the user hears it through Claude rather than from a
-    /// server that never started.
-    unusable: Option<String>,
 }
 
 impl LiveSource {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx: Mutex::new(ctx),
-            unusable: None,
-        }
-    }
-
-    /// A source whose every call fails with `why` (an unresolvable profile).
-    pub fn unusable(ctx: Ctx, why: String) -> Self {
-        Self {
-            ctx: Mutex::new(ctx),
-            unusable: Some(why),
         }
     }
 
     fn with<T>(&self, f: impl FnOnce(&Ctx, &str) -> Result<T, CliError>) -> Result<T, CliError> {
-        if let Some(why) = &self.unusable {
-            return Err(CliError::Other(format!(
-                "no Robinhood login profile could be chosen: {why}"
-            )));
-        }
         let ctx = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
         let token = ctx.access_token()?;
         f(&ctx, &token)
@@ -176,16 +159,28 @@ impl Source for LiveSource {
 /// The toolset `rhd mcp` serves.
 pub struct RobinhoodTools<S: Source> {
     source: S,
-    /// The login profile the source reads, named in the sign-in remedy.
-    profile: String,
+    /// The login profile the source reads, named in the sign-in remedy, or
+    /// why none could be chosen (several and no default, or an unknown
+    /// name). That fails each call rather than the server's start, so the
+    /// user hears it through Claude instead of from a server that never ran.
+    profile: Result<String, CliError>,
+    /// Today, for the year-to-date default; a parameter so tests can pin it.
+    today: fn() -> Civil,
 }
 
 impl<S: Source> RobinhoodTools<S> {
-    pub fn new(source: S, profile: impl Into<String>) -> Self {
+    pub fn new(source: S, profile: Result<String, CliError>) -> Self {
         Self {
             source,
-            profile: profile.into(),
+            profile,
+            today: dates::today,
         }
+    }
+
+    #[cfg(test)]
+    pub fn on(mut self, today: fn() -> Civil) -> Self {
+        self.today = today;
+        self
     }
 
     #[cfg(test)]
@@ -200,11 +195,26 @@ impl<S: Source> RobinhoodTools<S> {
             CliError::Auth(m) => ToolError::auth(m).with_fix(format!(
                 "Ask the user to run `rhd auth login --browser --profile {}` in a terminal, \
                  then call the tool again. Tools never sign in or create credentials themselves",
-                self.profile
+                self.profile.as_deref().unwrap_or("<NAME>")
             )),
             other => other.into(),
         }
     }
+}
+
+/// The error for a profile that could not be chosen, keeping its kind: usage
+/// for several profiles and no default, not found for an unknown name.
+fn unchosen(why: &CliError) -> ToolError {
+    let lead = "no Robinhood login profile could be chosen";
+    match why {
+        CliError::Usage(m) => ToolError::usage(format!("{lead}: {m}")),
+        CliError::NotFound(m) => ToolError::not_found(format!("{lead}: {m}")),
+        other => ToolError::other(format!("{lead}: {other}")),
+    }
+    .with_fix(
+        "Ask the user to choose one with `rhd profiles use <NAME>` in a terminal, or to start \
+         the server as `rhd mcp --profile <NAME>`, then call the tool again",
+    )
 }
 
 // ---- robinhood_portfolio ----------------------------------------------------
@@ -430,6 +440,9 @@ impl<S: Source> Toolset for RobinhoodTools<S> {
     }
 
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
+        if let Err(why) = &self.profile {
+            return Err(unchosen(why));
+        }
         match name {
             PORTFOLIO_TOOL => self.portfolio(parse_args(args)?).await,
             ACTIVITY_TOOL => self.activity(parse_args(args)?).await,
@@ -452,6 +465,7 @@ impl<S: Source> RobinhoodTools<S> {
             .into_iter()
             .filter(|a| accounts::is_active_row(a.row))
             .collect();
+        networth::require_active(&active).map_err(|e| self.err(e))?;
         let scope = pick(&active, account)?;
 
         // Every account's holdings, each row verified as that account's,
@@ -533,6 +547,7 @@ impl<S: Source> RobinhoodTools<S> {
         let (since, until) = window(
             non_empty(args.since.as_deref()),
             non_empty(args.until.as_deref()),
+            (self.today)(),
         )?;
         let account = non_empty(args.account.as_deref());
         let kind = non_empty(args.kind.as_deref()).map(str::to_ascii_lowercase);
@@ -866,9 +881,13 @@ fn date_arg(name: &str, v: Option<&str>) -> Result<Option<String>, ToolError> {
 }
 
 /// The inclusive window, defaulting to the year to date.
-fn window(since: Option<&str>, until: Option<&str>) -> Result<(String, String), ToolError> {
+fn window(
+    since: Option<&str>,
+    until: Option<&str>,
+    today: Civil,
+) -> Result<(String, String), ToolError> {
     let since = date_arg("since", since)?;
-    let until = date_arg("until", until)?.unwrap_or_else(|| dates::fmt_iso(dates::today()));
+    let until = date_arg("until", until)?.unwrap_or_else(|| dates::fmt_iso(today));
     let since = since.unwrap_or_else(|| format!("{}-01-01", &until[..4]));
     if since > until {
         return Err(ToolError::usage(format!(

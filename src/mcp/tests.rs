@@ -146,7 +146,12 @@ impl Source for Fixtures {
 }
 
 fn tools() -> RobinhoodTools<Fixtures> {
-    RobinhoodTools::new(Fixtures::new(), "default")
+    RobinhoodTools::new(Fixtures::new(), Ok("default".into())).on(summer)
+}
+
+/// The pinned "today" of every test, so none depends on the clock.
+fn summer() -> Civil {
+    (2026, 8, 31)
 }
 
 fn err(r: &CallToolResult) -> &str {
@@ -296,10 +301,24 @@ fn a_misattributed_position_fails_the_valuation() {
     let mut fixtures = Fixtures::new();
     let row = fixtures.positions[0].clone(); // SAMPLE01's
     fixtures.served_to.push(("SAMPLE02".into(), row));
-    let t = RobinhoodTools::new(fixtures, "default");
+    let t = RobinhoodTools::new(fixtures, Ok("default".into()));
     let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
     assert!(text.starts_with("upstream:"), "{text}");
     assert!(text.contains("different account"), "{text}");
+}
+
+/// A login with no active account is refused, as `rhd net-worth` refuses
+/// it, never reported as a net worth of zero.
+#[test]
+fn no_active_account_is_an_upstream_error_not_a_zero() {
+    let mut fixtures = Fixtures::new();
+    for row in &mut fixtures.accounts {
+        row["deactivated"] = json!(true);
+    }
+    let t = RobinhoodTools::new(fixtures, Ok("default".into()));
+    let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
+    assert!(text.starts_with("upstream:"), "{text}");
+    assert!(text.contains("no active brokerage accounts"), "{text}");
 }
 
 #[test]
@@ -401,7 +420,7 @@ fn a_payment_naming_no_account_is_kept_until_an_account_is_named() {
     orphan.as_object_mut().unwrap().remove("account_number_rhs");
     orphan["id"] = json!("00000000-0000-4000-8000-000000000039");
     fixtures.dividends.push(orphan);
-    let t = RobinhoodTools::new(fixtures, "default");
+    let t = RobinhoodTools::new(fixtures, Ok("default".into()));
     let year = json!({"since": "2026-01-01", "until": "2026-12-31", "type": "dividend"});
     let r = call(&t, ACTIVITY_TOOL, year.clone());
     let out = assert_fits(&t, ACTIVITY_TOOL, &r);
@@ -443,13 +462,31 @@ fn a_symbol_filter_skips_the_interest_read() {
 #[test]
 fn activity_defaults_to_the_year_to_date() {
     let t = tools();
-    let r = call(&t, ACTIVITY_TOOL, json!({"until": "2026-08-31"}));
-    let out = assert_fits(&t, ACTIVITY_TOOL, &r);
-    assert_eq!(out["since"], "2026-01-01");
-    let today = dates::fmt_iso(dates::today());
     let r = call(&t, ACTIVITY_TOOL, json!({}));
     let out = assert_fits(&t, ACTIVITY_TOOL, &r);
-    assert_eq!(out["until"], today);
+    assert_eq!(
+        (&out["since"], &out["until"]),
+        (&json!("2026-01-01"), &json!("2026-08-31"))
+    );
+}
+
+/// The default `since` is January 1 of `until`'s year, not of today's: last
+/// year asked for on New Year's Day is still last year.
+#[test]
+fn a_default_since_follows_until_across_a_year_end() {
+    fn new_year() -> Civil {
+        (2027, 1, 1)
+    }
+    let t = tools().on(new_year);
+    let r = call(&t, ACTIVITY_TOOL, json!({"until": "2026-12-31"}));
+    let out = assert_fits(&t, ACTIVITY_TOOL, &r);
+    assert_eq!(out["since"], "2026-01-01");
+    let r = call(&t, ACTIVITY_TOOL, json!({}));
+    let out = assert_fits(&t, ACTIVITY_TOOL, &r);
+    assert_eq!(
+        (&out["since"], &out["until"]),
+        (&json!("2027-01-01"), &json!("2027-01-01"))
+    );
 }
 
 #[test]
@@ -487,7 +524,7 @@ fn bad_arguments_fail_before_any_read() {
 /// An unpadded date compares as a string, so it is padded first.
 #[test]
 fn unpadded_dates_are_padded_before_any_comparison() {
-    let (s, u) = window(Some("2026-8-5"), Some("2026-08-31")).unwrap();
+    let (s, u) = window(Some("2026-8-5"), Some("2026-08-31"), summer()).unwrap();
     assert_eq!((s.as_str(), u.as_str()), ("2026-08-05", "2026-08-31"));
 }
 
@@ -533,7 +570,7 @@ fn tax_forms_alone_with_their_ids_on_request() {
 
 #[test]
 fn a_missing_session_asks_for_the_browser_login_in_a_terminal() {
-    let t = RobinhoodTools::new(Fixtures::new(), "household");
+    let t = RobinhoodTools::new(Fixtures::new(), Ok("household".into()));
     *t.source().fail.lock().unwrap() = Some(CliError::Auth(
         "no cached session for profile `household`".into(),
     ));
@@ -547,6 +584,34 @@ fn a_missing_session_asks_for_the_browser_login_in_a_terminal() {
             "{name}: {text}"
         );
         assert!(text.contains("never sign in"), "{name}: {text}");
+    }
+}
+
+/// A profile that could not be chosen fails every call before any read,
+/// keeping its kind, with the remedy of choosing one.
+#[test]
+fn an_unchosen_profile_keeps_its_kind_and_reads_nothing() {
+    for (why, kind) in [
+        (
+            CliError::Usage("several login profiles are configured (a, b)".into()),
+            "usage:",
+        ),
+        (
+            CliError::NotFound("no login profile named `c` (known: a, b)".into()),
+            "not_found:",
+        ),
+    ] {
+        let t = RobinhoodTools::new(Fixtures::new(), Err(why));
+        for name in [PORTFOLIO_TOOL, ACTIVITY_TOOL, DOCUMENTS_TOOL] {
+            let text = err(&call(&t, name, json!({}))).to_string();
+            assert!(text.starts_with(kind), "{name}: {text}");
+            assert!(
+                text.contains("no Robinhood login profile could be chosen"),
+                "{name}: {text}"
+            );
+            assert!(text.contains("`rhd profiles use <NAME>`"), "{name}: {text}");
+        }
+        assert!(t.source().calls().is_empty());
     }
 }
 

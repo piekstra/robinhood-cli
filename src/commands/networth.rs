@@ -164,6 +164,13 @@ fn scoped(
             )));
         }
     }
+    require_active(&active)?;
+    Ok(active)
+}
+
+/// The refusal `rhd net-worth` and the `robinhood_portfolio` tool share: a
+/// login with no active account to value is reported, never valued at zero.
+pub(crate) fn require_active<T>(active: &[T]) -> Result<(), CliError> {
     if active.is_empty() {
         return Err(CliError::Upstream(
             "Robinhood returned no active brokerage accounts to value — if this login really \
@@ -172,7 +179,7 @@ fn scoped(
                 .into(),
         ));
     }
-    Ok(active)
+    Ok(())
 }
 
 /// Verify and extract the holdings from one account's positions listing.
