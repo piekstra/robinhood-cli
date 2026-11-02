@@ -118,14 +118,20 @@ cannot be chosen (several, no default) fails each call, not the server.
 
 - Tests: `src/mcp/tests.rs` runs every tool in process over the fixtures
   through a fixture `Source` and cli-common's conformance helper;
-  `tests/mcp_stdio.rs` drives the binary over stdio without reading the
-  keychain; `tests/packaging.rs` holds `packaging/mcpb/manifest.json` to the
-  binary.
+  `tests/mcp_stdio.rs` drives the binary over stdio and `tests/mcp_http.rs`
+  over HTTP, without reading the keychain; `tests/packaging.rs` holds
+  `packaging/mcpb/manifest.json` to the binary.
 - Budget: the three definitions stay under 8,000 characters together
   (`the_definitions_stay_small` prints each size). Shorten a description
   before adding a field.
 - Releases attach `rhd-<version>.mcpb`, a Claude Desktop extension with no
   settings: it reads the keychain session of the default profile.
+- `rhd mcp --http --port <PORT>` (pk-cli-mcp's `http` feature) serves the
+  same tools on 127.0.0.1 behind a bearer token for the deploy-your-own
+  connector's home module (`HOME_ROBINHOOD`); `tests/mcp_http.rs` drives it
+  with the token in `RHD_MCP_TOKEN` and a scratch config with two profiles
+  and none selected, so its tool call stops on choosing a profile and it
+  reads no keychain.
 
 ## Non-negotiables
 
