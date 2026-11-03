@@ -202,7 +202,7 @@ fn finish(
     device_token: &str,
     tokens: Tokens,
 ) -> Result<(), CliError> {
-    let accounts = rh.paginate(
+    let listing = rh.paginate(
         &tokens.access_token,
         crate::commands::accounts::PATH,
         &crate::commands::accounts::all_accounts_query(),
@@ -218,13 +218,13 @@ fn finish(
     store_session(creds, profile, &tokens)?;
 
     // `paginate` walked every page, so the listing is the whole login.
-    record_profile(store, cfg, profile, Some(username), &accounts, true)?;
+    record_profile(store, cfg, profile, Some(username), &listing, true)?;
 
     if !common.quiet {
         eprintln!(
             "logged in (profile `{profile}`) — {} account{} visible",
-            accounts.len(),
-            if accounts.len() == 1 { "" } else { "s" }
+            listing.len(),
+            if listing.len() == 1 { "" } else { "s" }
         );
     }
     Ok(())
