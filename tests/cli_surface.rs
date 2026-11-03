@@ -222,6 +222,111 @@ fn auth_login_help_leads_with_browser() {
         .stdout(contains("--browser"));
 }
 
+/// `--fresh-profile` picks the profile of a browser sign-in, so it means
+/// nothing without `--browser`: exit 2 at parse time, before config, keychain,
+/// Chrome or the network. Each of these reaches the network if it ever parses.
+#[test]
+fn fresh_profile_needs_the_browser_flag() {
+    for extra in [
+        &[][..],
+        &["--session-stdin"],
+        &["--stdin"],
+        &["--from-env", "SOME_VAR"],
+        &["--no-verify"],
+        &["--code", "123456"],
+        &["--resume"],
+        &["--username", "user@example.com"],
+        &["--channel", "email"],
+    ] {
+        let mut cmd = isolated("freshneedsbrowser");
+        cmd.env("RHD_CHROME", NO_CHROME);
+        piped(cmd)
+            .args(["auth", "login", "--fresh-profile"])
+            .args(extra)
+            .write_stdin("Bearer SAMPLE-ACCESS-TOKEN-NOT-A-REAL-CREDENTIAL")
+            .assert()
+            .code(2);
+    }
+}
+
+/// The help says the profile stays on disk, per login, and how to remove it.
+#[test]
+fn the_help_says_what_happens_to_the_kept_profile() {
+    let out = rhd().args(["auth", "login", "--help"]).assert().success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    for needle in ["--fresh-profile", "keeps for", "rhd auth logout"] {
+        assert!(text.contains(needle), "help is missing {needle:?}:\n{text}");
+    }
+    rhd()
+        .args(["auth", "logout", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("kept browser profile"))
+        .stdout(contains("exits 1"))
+        .stdout(contains("already cleared"));
+    rhd()
+        .args(["profiles", "remove", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("kept browser"));
+}
+
+/// The capture takes the session out of the profile `rhd` keeps. The Console
+/// snippet runs in the owner's own browser, so it must never do the same.
+#[test]
+fn the_console_snippet_stays_read_only() {
+    let out = rhd().args(["auth", "login", "--help"]).assert().success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(text.contains("web:auth_state"), "{text}");
+    assert!(!text.contains("removeItem"), "{text}");
+}
+
+/// A login whose name no kept browser profile can carry is refused before
+/// Chrome starts, and stores nothing. With `--fresh-profile` it gets as far as
+/// looking for Chrome, which is where this test stops (and no profile has been
+/// touched by then).
+#[test]
+fn a_profile_name_no_browser_profile_can_carry_is_refused() {
+    for name in ["has.dot", "has space"] {
+        let config = scratch_config("browsername");
+        let _ = std::fs::remove_file(&config);
+        let mut login = rhd();
+        login
+            .arg("--config")
+            .arg(&config)
+            .env_remove("RHD_ACCOUNT")
+            .env("RHD_PROFILE", name)
+            .env("RHD_CHROME", NO_CHROME);
+        login
+            .args(["auth", "login", "--browser"])
+            .assert()
+            .code(2)
+            .stderr(contains("1 to 64"))
+            .stderr(contains("--fresh-profile"));
+        let mut fresh = rhd();
+        fresh
+            .arg("--config")
+            .arg(&config)
+            .env_remove("RHD_ACCOUNT")
+            .env("RHD_PROFILE", name)
+            .env("RHD_CHROME", NO_CHROME);
+        fresh
+            .args(["auth", "login", "--browser", "--fresh-profile"])
+            .assert()
+            .code(1)
+            .stderr(contains("RHD_CHROME"));
+        assert!(!config.exists(), "{name}: wrote config for a refused login");
+    }
+}
+
+#[test]
+fn a_profile_name_too_long_for_a_browser_profile_cannot_be_added() {
+    isolated("longname")
+        .args(["profiles", "add", &"a".repeat(65)])
+        .assert()
+        .code(2);
+}
+
 /// `--browser` takes the session from the window: any other credential
 /// source or password-login flag beside it is a usage error at parse time,
 /// before config, keychain or network (and before Chrome).

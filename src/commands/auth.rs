@@ -14,9 +14,25 @@
 //!   after a real read succeeds with it, so a login that authenticates but
 //!   can't fetch anything leaves nothing broken behind. That holds for a
 //!   session from a browser (`--browser`, `--session-stdin`) too.
+//! - **A retired token must not stay where a window can use it.** `--browser`
+//!   runs Chrome in a profile kept per login, so a re-login often asks for less.
+//!   The capture takes the session out of that profile as it reads it
+//!   ([`capture::SESSION_EXPRESSION`]), and the tab closes only on a session
+//!   Robinhood accepts ([`confirm_candidate`]).
+//! - **The kept profile is a full Chrome profile:** Robinhood's cookies, browsing
+//!   history with full URLs, query strings included, the HTTP cache and site
+//!   storage. Chrome's cookie encryption does not cover the last three, so the
+//!   directory's `0700` mode is their only protection, and ordinary backups
+//!   usually include it. On Linux with no desktop keyring Chrome encrypts the
+//!   cookies with a fixed, publicly known key, so there the session cookie has
+//!   only `0700` too. It stays on disk until `auth logout` or `profiles remove`
+//!   removes it ([`logout_browser`]), after a failed sign-in too
+//!   ([`through_the_window`]).
+
+use std::sync::Mutex;
 
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
-use pk_cli_browser::{BrowserError, Launch};
+use pk_cli_browser::{BrowserError, Confirm, Launch};
 use pk_cli_config::ConfigStore;
 use pk_cli_core::{CliError, CommonArgs};
 use pk_cli_secrets::{CredentialStore, Secret};
@@ -248,50 +264,212 @@ fn note_login(
     }
 }
 
-/// `rhd auth login --browser`: the owner signs in on robinhood.com in a
-/// scratch Chrome, and the session the web app stores is read out of it
-/// (docs/api.md §2.8).
+/// `rhd auth login --browser`: the owner signs in on robinhood.com in the
+/// Chrome profile `rhd` keeps for this login, and the session the web app
+/// stores is read out of it (docs/api.md §2.8).
 ///
 /// The capture answers with the `web:auth_state` JSON the `--session-stdin`
 /// Console snippet copies, so from there it takes the same road:
 /// [`capture::parse`], one proving read, the same keychain item. The crate
 /// closes the tab the moment the session is read, so the web app cannot
 /// renew (and so rotate) the refresh token `rhd` is about to store, then
-/// kills Chrome and deletes its profile.
+/// stops Chrome; its profile stays for the next sign-in, unless
+/// `--fresh-profile` asked for a scratch one.
 pub fn browser_login(
     common: &CommonArgs,
     store: &ConfigStore,
     cfg: Config,
     profile: &str,
+    fresh_profile: bool,
 ) -> Result<(), CliError> {
-    let captured = pk_cli_browser::capture(
-        Launch::new(config::BIN)
-            .url(capture::LOGIN_URL)
-            .quiet(common.quiet)
-            .login_hint(format!("rhd auth login --browser --profile {profile}")),
-        &capture::browser_capture()?,
-        pk_cli_browser::DEFAULT_TIMEOUT,
+    let launch = browser_launch(profile, fresh_profile, common.quiet)?;
+    let refused = Mutex::new(None);
+    let capture = capture::browser_capture()?.confirm(move |candidate| {
+        confirm_candidate(
+            candidate,
+            crate::client::now_unix(),
+            &refused,
+            prove_session,
+        )
+    });
+    through_the_window(
+        profile,
+        fresh_profile,
+        || pk_cli_browser::capture(launch, &capture, pk_cli_browser::DEFAULT_TIMEOUT),
+        |raw| import(common, store, cfg, profile, &raw, Source::Browser),
     )
-    .map_err(browser_failed)?;
+}
+
+/// A browser sign-in from the window on, with every way it can fail in one
+/// place, so a new one cannot miss [`failed_sign_in`]: the window's own ending,
+/// the confirm hook's, the read after it and the keychain write.
+///
+/// Only three failures skip the note, because they end the sign-in before Chrome
+/// runs in the profile: no Chrome, which points at the DevTools fallback instead, a
+/// malformed launch, and a profile refused for repair, whose own message names the
+/// path and the fix.
+fn through_the_window(
+    profile: &str,
+    fresh_profile: bool,
+    capture: impl FnOnce() -> Result<pk_cli_browser::Captured, BrowserError>,
+    finish: impl FnOnce(Secret) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let captured = match capture() {
+        Err(BrowserError::ChromeNotFound(msg)) => {
+            return Err(CliError::Other(format!(
+                "{msg}. Without Chrome, import a session from your own browser instead: `rhd \
+                 auth login --help` walks through `--session-stdin`"
+            )))
+        }
+        Err(e @ (BrowserError::Invalid(_) | BrowserError::Profile(_))) => return Err(e.into()),
+        other => other,
+    };
+    captured
+        .map_err(CliError::from)
+        .and_then(|captured| finish(session_text(&captured)?))
+        .map_err(|e| failed_sign_in(e, profile, fresh_profile))
+}
+
+/// The Chrome launch for `profile`'s sign-in, in a Chrome profile of its own,
+/// so one household login's sign-in never opens already signed in as another.
+///
+/// A login profile whose name a Chrome profile cannot carry (one made before
+/// the rule, or named by `--profile` or `RHD_PROFILE` on a fresh install) is
+/// refused here, before Chrome starts: the name is checked and never rewritten,
+/// so it can never land on another login's profile. `--fresh-profile` needs no
+/// name, so it still signs such a login in.
+fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Launch, CliError> {
+    let launch = Launch::new(config::BIN)
+        .url(capture::LOGIN_URL)
+        .quiet(quiet);
+    if fresh_profile {
+        return Ok(launch.fresh_profile(true).login_hint(format!(
+            "rhd auth login --browser --profile {profile} --fresh-profile"
+        )));
+    }
+    if !config::profile_name_ok(profile) {
+        return Err(CliError::Usage(format!(
+            "login profile `{profile}` cannot keep a browser profile: the name must be 1 to 64 \
+             ASCII letters, digits, `-` or `_`. Sign in once with `--fresh-profile`, or use a \
+             profile with such a name (`rhd profiles add <NAME>`)"
+        )));
+    }
+    Ok(launch
+        .profile_name(profile)
+        .login_hint(format!("rhd auth login --browser --profile {profile}")))
+}
+
+/// Whether the session in the window is one to take, which closes the tab.
+///
+/// A capture takes `web:auth_state` out of the profile it reads from, but one
+/// can still be there as the page opens: left by a sign-in that ended before the
+/// read, or by a Chrome stopped before its removal reached the disk. It may be
+/// expired or already rotated away. Taking it would close the tab before the web
+/// app could ask the owner to sign in. So a session that does not parse, is past
+/// the point `rhd` would renew it, or that Robinhood refuses keeps the tab open.
+///
+/// That point is [`Tokens::is_expired_at`], `rhd`'s own renewal rule, not the
+/// token's bare expiry: in between, `rhd` may have rotated the refresh token
+/// while the access token still works, and storing that copy would replace the
+/// live session with a retired refresh token.
+///
+/// A token Robinhood refused is remembered and not sent again (one attempt, no
+/// loops), so a tab sitting on a dead session costs one read rather than one
+/// per poll. A read that cannot decide ends the wait and takes nothing: a
+/// throttle, Robinhood down, or an answer that is not the accounts list.
+fn confirm_candidate(
+    candidate: &pk_cli_browser::Captured,
+    now: u64,
+    refused: &Mutex<Option<Secret>>,
+    prove: impl FnOnce(&str) -> Result<Value, ReadFailure>,
+) -> Confirm {
+    const DEAD: &str =
+        "Robinhood refused the session this window holds, and no new sign-in has finished";
+    let raw = match session_text(candidate) {
+        Ok(raw) => raw,
+        Err(e) => return Confirm::NotYet(e.to_string()),
+    };
+    let Captured { shape, tokens } = match capture::parse(raw.expose(), now, Source::Browser) {
+        Ok(captured) => captured,
+        Err(e) => return Confirm::NotYet(e.to_string()),
+    };
+    if tokens.is_expired_at(now) {
+        return Confirm::NotYet(
+            "the session this window holds has expired, and no new sign-in has finished".into(),
+        );
+    }
+    let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
+    if refused
+        .as_ref()
+        .is_some_and(|token| token.expose() == tokens.access_token)
+    {
+        return Confirm::NotYet(DEAD.into());
+    }
+    match prove(&tokens.access_token) {
+        Ok(page) if accounts_page(&page).is_some() => Confirm::Ready,
+        Ok(_) => Confirm::Fail(unproven(no_accounts_list(), shape, Source::Browser)),
+        Err(failure) if failure.is_auth() => {
+            *refused = Some(Secret::new(tokens.access_token.clone()));
+            Confirm::NotYet(DEAD.into())
+        }
+        Err(failure) => Confirm::Fail(unproven(failure, shape, Source::Browser)),
+    }
+}
+
+/// The session a capture read, as `--session-stdin` would have it.
+fn session_text(captured: &pk_cli_browser::Captured) -> Result<Secret, CliError> {
     let value = captured.value().ok_or_else(|| {
         CliError::Other("the browser capture came back without the session".into())
     })?;
-    let raw = capture::fill_device_token(
+    Ok(capture::fill_device_token(
         value.expose(),
         captured.cookie(capture::DEVICE_COOKIE).map(Secret::expose),
-    );
-    import(common, store, cfg, profile, &raw, Source::Browser)
+    ))
 }
 
-/// A failed browser sign-in as the family error, pointing at the DevTools
-/// fallback when there is no Chrome to sign in through.
-fn browser_failed(e: BrowserError) -> CliError {
-    match e {
-        BrowserError::ChromeNotFound(msg) => CliError::Other(format!(
-            "{msg}. Without Chrome, import a session from your own browser instead: `rhd auth \
-             login --help` walks through `--session-stdin`"
-        )),
-        other => other.into(),
+/// The confirm hook's read, on its own client: the hook has to be `Sync` and
+/// [`Rh`] is not. Bounded by that client's 60 s timeout.
+fn prove_session(access_token: &str) -> Result<Value, ReadFailure> {
+    let rh = Rh::new().map_err(|e| ReadFailure::Upstream(e.to_string()))?;
+    read_accounts(&rh, access_token)
+}
+
+/// The one authenticated read that proves a session. `probe`, not `get`: a
+/// refusal here must name the session, not send the owner back to the password
+/// login (see [`unproven`]).
+fn read_accounts(rh: &Rh, access_token: &str) -> Result<Value, ReadFailure> {
+    rh.probe(
+        access_token,
+        &rh.url(crate::commands::accounts::PATH),
+        &crate::commands::accounts::all_accounts_query(),
+    )
+}
+
+/// A failed sign-in, saying that the kept profile stays with whatever the
+/// sign-in got as far as, which can be a live session: the owner may move on and
+/// never log out. A `--fresh-profile` sign-in has already removed its scratch one,
+/// and the crate keeps a profile only on unix. The exit code does not change.
+fn failed_sign_in(error: CliError, profile: &str, fresh_profile: bool) -> CliError {
+    if fresh_profile || !cfg!(unix) {
+        return error;
+    }
+    let note = |m: String| {
+        format!(
+            "{}. The browser profile stays on disk with what that window left in it, which can \
+             be a live session; once no window is using it, `rhd auth logout --profile \
+             {profile}` removes it and clears any stored session with it, and `--fresh-profile` \
+             signs in without it.",
+            m.trim_end_matches('.')
+        )
+    };
+    match error {
+        CliError::Usage(m) => CliError::Usage(note(m)),
+        CliError::Auth(m) => CliError::Auth(note(m)),
+        CliError::NotFound(m) => CliError::NotFound(note(m)),
+        CliError::Upstream(m) => CliError::Upstream(note(m)),
+        CliError::ConfirmationRequired(m) => CliError::ConfirmationRequired(note(m)),
+        CliError::Keychain(m) => CliError::Keychain(note(m)),
+        CliError::Other(m) => CliError::Other(note(m)),
     }
 }
 
@@ -326,26 +504,10 @@ fn import(
         capture::parse(raw.expose(), crate::client::now_unix(), source)?;
 
     let rh = Rh::new()?;
-    // `probe`, not `get`: a refusal here must name the session, not send the
-    // owner back to the password login (see `unproven`).
-    let page = rh
-        .probe(
-            &tokens.access_token,
-            &rh.url(crate::commands::accounts::PATH),
-            &crate::commands::accounts::all_accounts_query(),
-        )
+    let page = read_accounts(&rh, &tokens.access_token)
         .map_err(|failure| unproven(failure, shape, source))?;
-    let (visible, more) = accounts_page(&page).ok_or_else(|| {
-        unproven(
-            ReadFailure::Upstream(
-                "the accounts read answered without a `results` list, so the session is \
-                 unproven"
-                    .into(),
-            ),
-            shape,
-            source,
-        )
-    })?;
+    let (visible, more) =
+        accounts_page(&page).ok_or_else(|| unproven(no_accounts_list(), shape, source))?;
 
     let creds = CredentialStore::for_binary(config::BIN);
     creds.set(&config::token_key(profile), &tokens.to_secret())?;
@@ -445,9 +607,11 @@ impl SessionImport {
             ));
         }
         out.push(match self.source {
-            // The window closed on capture, and its profile went with it.
-            Source::Browser => "the sign-in window and its Chrome profile are gone, so rhd holds \
-                                the session's only copy: no browser can renew it or log it out"
+            // The window closed on capture, and the session left its profile.
+            Source::Browser => "the sign-in window is closed and the session is out of its Chrome \
+                                profile, so no browser can renew it or log it out; the profile \
+                                stays on disk for the next sign-in until `rhd auth logout` \
+                                removes it"
                 .into(),
             Source::Stdin => "close the robinhood.com tab, but do not click Log out: logging out \
                               revokes the session rhd just stored"
@@ -473,6 +637,13 @@ fn unproven(failure: ReadFailure, shape: capture::Shape, source: Source) -> CliE
     } else {
         CliError::Upstream(msg)
     }
+}
+
+/// A proving read that succeeded and still proves nothing.
+fn no_accounts_list() -> ReadFailure {
+    ReadFailure::Upstream(
+        "the accounts read answered without a `results` list, so the session is unproven".into(),
+    )
 }
 
 /// The proving read's accounts and whether more pages follow, or `None` if
@@ -575,24 +746,110 @@ pub fn logout(
     if forget {
         creds.delete(&config::password_key(profile))?;
         creds.delete(&config::device_key(profile))?;
+    }
+
+    let browser = finish_logout(store, &mut cfg, profile, forget, || {
+        pk_cli_browser::forget_named_profile(config::BIN, profile)
+    })?;
+
+    if !common.quiet {
+        eprintln!("{}", logged_out(profile, forget, browser));
+    }
+    Ok(())
+}
+
+/// A logout's steps past the keychain; `true` when there was a browser profile
+/// to remove. The browser profile goes before the config entry: a refusal (its
+/// window still open) leaves the credentials cleared and asks for another try,
+/// which with `--forget` has to find the profile still configured. Its error
+/// says what is already gone ([`logout_refused`]).
+fn finish_logout(
+    store: &ConfigStore,
+    cfg: &mut Config,
+    profile: &str,
+    forget: bool,
+    forget_browser: impl FnOnce() -> Result<bool, BrowserError>,
+) -> Result<bool, CliError> {
+    let browser = logout_browser(forget_browser).map_err(|e| {
+        if forget {
+            logout_refused(
+                &format!("the session and stored credentials of profile `{profile}` are cleared"),
+                "the browser profile and this login's config entry remain",
+                &format!("rhd auth logout --forget --profile {profile}"),
+                &e,
+            )
+        } else {
+            logout_refused(
+                &format!("the session of profile `{profile}` is cleared"),
+                "only the browser profile remains",
+                &format!("rhd auth logout --profile {profile}"),
+                &e,
+            )
+        }
+    })?;
+    if forget {
         cfg.profiles.remove(profile);
         if cfg.default_profile.as_deref() == Some(profile) {
             cfg.default_profile = None;
         }
-        store.save(&cfg)?;
+        store.save(cfg)?;
     }
+    Ok(browser)
+}
 
-    if !common.quiet {
-        eprintln!(
-            "logged out of profile `{profile}`{}",
-            if forget {
-                " and forgot its stored credentials"
-            } else {
-                ""
-            }
-        );
+fn logged_out(profile: &str, forget: bool, browser: bool) -> String {
+    format!(
+        "logged out of profile `{profile}`{}{}",
+        if forget {
+            " and forgot its stored credentials"
+        } else {
+            ""
+        },
+        if browser {
+            "; browser profile removed"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The browser step of `auth logout` and `profiles remove`: `true` when there
+/// was a kept profile to remove. That profile holds Robinhood's own cookies, its
+/// browsing history and cache, so a logout removes it too and the next sign-in
+/// starts signed out. The removal is passed in: the binary binds it to
+/// `forget_named_profile(BIN, name)`, the tests to `forget_named_profile_in`
+/// under a temp dir, so a test never removes the owner's real profile.
+///
+/// A name no Chrome profile can carry is not a failure here: a launch refuses
+/// it too ([`browser_launch`]), so it never had a kept profile to remove, and
+/// its logout is done. Busy (`ProfileInUse`) or in need of repair (`Profile`) is
+/// the caller's to report ([`logout_refused`]): the rest is cleared by then.
+pub(crate) fn logout_browser(
+    forget: impl FnOnce() -> Result<bool, BrowserError>,
+) -> Result<bool, BrowserError> {
+    match forget() {
+        Err(BrowserError::Invalid(_)) => Ok(false),
+        other => other,
     }
-    Ok(())
+}
+
+/// A logout that exits 1 has still done most of its work, so its error says
+/// what is already gone, what remains and how to finish.
+pub(crate) fn logout_refused(
+    cleared: &str,
+    remains: &str,
+    finish: &str,
+    error: &BrowserError,
+) -> CliError {
+    let when = match error {
+        BrowserError::ProfileInUse(_) => "Once that window is closed, run",
+        _ => "Repair or delete that path, then run",
+    };
+    let reason = error.to_string();
+    CliError::Other(format!(
+        "partly logged out: {cleared} and {remains}. {}. {when} `{finish}` again to remove it.",
+        reason.trim_end_matches('.')
+    ))
 }
 
 pub fn set_credential(
@@ -836,10 +1093,11 @@ mod tests {
         }
     }
 
-    /// A browser sign-in's report says the window is gone (there is no tab
-    /// left to log out of), and its no-device remedy is the browser again.
+    /// A browser sign-in's report says the window is closed (there is no tab
+    /// left to log out of), what removes the kept profile, and its no-device
+    /// remedy is the browser again.
     #[test]
-    fn the_browser_report_says_rhd_holds_the_only_copy() {
+    fn the_browser_report_says_the_window_is_closed() {
         let mut r = report(capture::Shape::WebAuthState, true, false);
         r.source = Source::Browser;
         let text = r.lines().join("\n");
@@ -849,7 +1107,8 @@ mod tests {
         );
         assert!(text.contains("renews unattended"), "{text}");
         assert!(text.contains("rhd auth login --browser"), "{text}");
-        assert!(text.contains("only copy"), "{text}");
+        assert!(text.contains("window is closed"), "{text}");
+        assert!(text.contains("rhd auth logout"), "{text}");
         assert!(!text.contains("Console snippet"), "{text}");
         assert!(!text.contains("close the robinhood.com tab"), "{text}");
         assert_eq!(serde_json::to_value(&r).unwrap()["source"], "browser");
@@ -870,20 +1129,607 @@ mod tests {
         assert!(!msg.contains("stdin"), "{msg}");
     }
 
-    /// No Chrome is the one browser failure with a fallback to name.
+    /// No Chrome is the one browser failure with a fallback to name, and the
+    /// others that end the sign-in before Chrome runs in the profile do not
+    /// mention it staying.
     #[test]
-    fn no_chrome_points_at_the_devtools_fallback() {
-        let err = browser_failed(BrowserError::ChromeNotFound(
-            "no Chrome found — install Google Chrome, or set RHD_CHROME to a Chrome binary".into(),
-        ));
+    fn a_failure_before_chrome_runs_does_not_mention_the_profile_staying() {
+        let err = through_the_window(
+            "primary",
+            false,
+            || {
+                Err(BrowserError::ChromeNotFound(
+                    "no Chrome found — install Google Chrome, or set RHD_CHROME to a Chrome binary"
+                        .into(),
+                ))
+            },
+            |_| panic!("no session to store"),
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1);
         let msg = err.to_string();
         assert!(msg.contains("RHD_CHROME"), "{msg}");
         assert!(msg.contains("--session-stdin"), "{msg}");
+        assert!(!msg.contains("stays on disk"), "{msg}");
 
-        let timed_out = browser_failed(BrowserError::TimedOut("timed out".into()));
-        assert_eq!(timed_out.exit_code(), 3);
-        assert_eq!(timed_out.to_string(), "timed out");
+        for error in [
+            BrowserError::Invalid("dummy".into()),
+            BrowserError::Profile("dummy".into()),
+        ] {
+            let err = through_the_window(
+                "primary",
+                false,
+                || Err(error),
+                |_| panic!("no session to store"),
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 1, "{err}");
+            assert_eq!(err.to_string(), "dummy");
+        }
+    }
+
+    /// The failures a sign-in can end in once Chrome has run in the profile,
+    /// with the exit code each must keep.
+    fn window_failures() -> Vec<(BrowserError, i32)> {
+        vec![
+            (BrowserError::TimedOut("dummy.".into()), 3),
+            (BrowserError::WindowClosed("dummy.".into()), 3),
+            (BrowserError::Canceled, 1),
+            (BrowserError::Launch("dummy.".into()), 1),
+            (BrowserError::ProfileInUse("dummy.".into()), 1),
+            (
+                BrowserError::Handler(CliError::Upstream("dummy.".into())),
+                5,
+            ),
+            (BrowserError::Handler(CliError::Auth("dummy.".into())), 3),
+        ]
+    }
+
+    fn assert_says_it_stays(err: &CliError) {
+        if cfg!(unix) {
+            let message = err.to_string();
+            assert!(
+                message.contains("browser profile stays on disk"),
+                "{message}"
+            );
+            assert!(
+                message.contains("`rhd auth logout --profile dummy-one`"),
+                "{message}"
+            );
+        }
+    }
+
+    /// Every way a sign-in can fail with Chrome in the kept profile says so,
+    /// whichever step failed, and keeps its exit code. A scratch profile is
+    /// already gone, so it says nothing.
+    #[test]
+    fn every_failed_sign_in_says_the_kept_profile_stays() {
+        for (error, code) in window_failures() {
+            let err = through_the_window(
+                "dummy-one",
+                false,
+                || Err(error),
+                |_| panic!("no session to store"),
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), code, "{err}");
+            assert_says_it_stays(&err);
+        }
+        for (error, code) in window_failures() {
+            let err = through_the_window(
+                "dummy-one",
+                true,
+                || Err(error),
+                |_| panic!("no session to store"),
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), code, "{err}");
+            assert!(!err.to_string().contains("stays on disk"), "{err}");
+        }
+    }
+
+    /// After the capture the session is read and stored, and a live session can
+    /// be left in the profile if that fails.
+    #[test]
+    fn a_failure_after_the_capture_says_the_kept_profile_stays() {
+        for (failure, code) in [
+            (CliError::Keychain("dummy: could not write".into()), 1),
+            (CliError::Upstream("dummy outage".into()), 5),
+            (CliError::Auth("dummy refusal".into()), 3),
+        ] {
+            let captured = held(&token_until(NOW + 3600));
+            let err = through_the_window("dummy-one", false, || Ok(captured), |_| Err(failure))
+                .unwrap_err();
+            assert_eq!(err.exit_code(), code, "{err}");
+            assert_says_it_stays(&err);
+        }
+        let empty = pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST).build();
+        let err = through_the_window(
+            "dummy-one",
+            false,
+            || Ok(empty),
+            |_| panic!("nothing was read"),
+        )
+        .unwrap_err();
+        assert_says_it_stays(&err);
+
+        let captured = held(&token_until(NOW + 3600));
+        let err = through_the_window(
+            "dummy-one",
+            true,
+            || Ok(captured),
+            |_| Err(CliError::Keychain("dummy: could not write".into())),
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("stays on disk"), "{err}");
+
+        let captured = held(&token_until(NOW + 3600));
+        through_the_window("dummy-one", false, || Ok(captured), |_| Ok(())).unwrap();
+    }
+
+    /// The note changes the message and never the exit code.
+    #[test]
+    fn the_note_keeps_every_exit_code() {
+        for (error, code) in [
+            (CliError::Usage("dummy.".into()), 2),
+            (CliError::Auth("dummy.".into()), 3),
+            (CliError::NotFound("dummy.".into()), 4),
+            (CliError::Upstream("dummy.".into()), 5),
+            (CliError::ConfirmationRequired("dummy.".into()), 6),
+            (CliError::Keychain("dummy.".into()), 1),
+            (CliError::Other("dummy.".into()), 1),
+        ] {
+            let err = failed_sign_in(error, "dummy-one", false);
+            assert_eq!(err.exit_code(), code, "{err}");
+            assert_says_it_stays(&err);
+            if cfg!(unix) {
+                assert!(err.to_string().contains("dummy. The browser"), "{err}");
+            }
+        }
+    }
+
+    /// The hook against real answers: a throttle or an outage ends the wait
+    /// rather than loop on it, a refusal keeps the tab open, and only an accounts
+    /// list closes it. Neither of the first two is remembered as a refused token.
+    #[test]
+    fn a_read_that_cannot_decide_ends_the_wait_and_accepts_nothing() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        const URL: &str = "https://api.robinhood.com/accounts/";
+        let read = |status: u16, body: &str| crate::client::classify(status, URL, None, body);
+        let list = r#"{"results":[]}"#;
+        let token = token_until(NOW + 3600);
+
+        for (status, body) in [
+            (429, PAGE),
+            (429, "{}"),
+            (429, list),
+            (500, "{}"),
+            (502, "bad gateway"),
+            (503, PAGE),
+            (503, list),
+            (200, ""),
+            (200, "{}"),
+            (200, "{nope"),
+        ] {
+            let refused = Mutex::new(None);
+            let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(status, body));
+            match answer {
+                Confirm::Fail(e) => assert_eq!(e.exit_code(), 5, "{status} {body}: {e}"),
+                other => panic!("{status} {body} must end the wait: {other:?}"),
+            }
+            assert!(refused.lock().unwrap().is_none(), "{status} {body}");
+        }
+
+        for (status, body) in [(401, "{}"), (403, "{}"), (403, PAGE), (200, PAGE)] {
+            let refused = Mutex::new(None);
+            let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(status, body));
+            assert!(
+                matches!(answer, Confirm::NotYet(_)),
+                "{status} {body}: {answer:?}"
+            );
+            assert!(refused.lock().unwrap().is_some(), "{status} {body}");
+        }
+
+        let refused = Mutex::new(None);
+        let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(200, list));
+        assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    /// A session the kept profile holds, as the capture would read it.
+    fn held(access_token: &str) -> pk_cli_browser::Captured {
+        let mut session: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/web_auth_state.json")).unwrap();
+        session["access_token"] = json!(access_token);
+        pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST)
+            .value(session.to_string())
+            .build()
+    }
+
+    fn token_until(exp: u64) -> String {
+        capture::tests::jwt(&json!({ "exp": exp }))
+    }
+
+    /// What the kept profile changes: a session can still be there as the page
+    /// opens. `capture::parse` would refuse an expired one, but only after the
+    /// tab had closed, on every later run. It keeps the tab open now, with no
+    /// read.
+    #[test]
+    fn an_expired_session_in_the_kept_profile_keeps_the_tab_open() {
+        let refused = Mutex::new(None);
+        let answer = confirm_candidate(&held(&token_until(NOW - 1)), NOW, &refused, |_| {
+            panic!("an expired session must not reach Robinhood")
+        });
+        match answer {
+            Confirm::NotYet(reason) => assert!(reason.contains("expired"), "{reason}"),
+            other => panic!("must keep waiting: {other:?}"),
+        }
+    }
+
+    /// Inside the minute before expiry `rhd` renews, so a token that still
+    /// works may have had its refresh token rotated away. Storing it would
+    /// replace the live session, so it is never read, let alone taken.
+    #[test]
+    fn a_token_rhd_may_already_have_renewed_is_not_taken() {
+        let refused = Mutex::new(None);
+        let answer = confirm_candidate(&held(&token_until(NOW + 60)), NOW, &refused, |_| {
+            panic!("a token inside the renewal window must not reach Robinhood")
+        });
+        assert!(matches!(answer, Confirm::NotYet(_)), "{answer:?}");
+    }
+
+    #[test]
+    fn a_session_robinhood_accepts_closes_the_tab() {
+        let refused = Mutex::new(None);
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &refused, |_| {
+            Ok(json!({ "results": [] }))
+        });
+        assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+    }
+
+    /// A live-looking session Robinhood refuses keeps the tab open for the
+    /// owner to sign in, and is read once however many polls see it. The
+    /// session that replaces it is read.
+    #[test]
+    fn a_refused_session_waits_and_is_not_sent_again() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let refused = Mutex::new(None);
+        let dead = token_until(NOW + 3600);
+        for _ in 0..3 {
+            let answer = confirm_candidate(&held(&dead), NOW, &refused, |_| {
+                reads.set(reads.get() + 1);
+                Err(ReadFailure::Rejected {
+                    status: 401,
+                    detail: None,
+                })
+            });
+            match answer {
+                Confirm::NotYet(reason) => assert!(reason.contains("refused"), "{reason}"),
+                other => panic!("must keep waiting: {other:?}"),
+            }
+        }
+        assert_eq!(reads.get(), 1, "the dead token was sent again");
+
+        let answer = confirm_candidate(&held(&token_until(NOW + 3601)), NOW, &refused, |_| {
+            reads.set(reads.get() + 1);
+            Ok(json!({ "results": [] }))
+        });
+        assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn a_failure_waiting_will_not_fix_ends_the_wait() {
+        let refused = Mutex::new(None);
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &refused, |_| {
+            Err(ReadFailure::Throttled { retry_after: None })
+        });
+        match answer {
+            Confirm::Fail(e) => assert_eq!(e.exit_code(), 5),
+            other => panic!("must end the wait: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_with_nothing_readable_keeps_waiting() {
+        let refused = Mutex::new(None);
+        let none = pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST).build();
+        let junk = pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST)
+            .value("not a session")
+            .build();
+        for candidate in [none, junk] {
+            let answer =
+                confirm_candidate(&candidate, NOW, &refused, |_| panic!("nothing to read yet"));
+            assert!(matches!(answer, Confirm::NotYet(_)), "{answer:?}");
+        }
+    }
+
+    fn kept_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        root.join(format!("piekstra.{}", config::BIN))
+            .join(format!("browser-profile-{name}"))
+    }
+
+    /// A script that stands in for Chrome: it reports a debug port, marks the
+    /// profile it was given and sleeps until stopped. It is what a launch runs
+    /// in these tests, so the real profile selection and lock are exercised
+    /// and no Chrome starts.
+    #[cfg(unix)]
+    fn stand_in_chrome(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stand-in-chrome");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) \
+             d=\"${a#--user-data-dir=}\";; esac; done\n: > \"$d/stand-in-ran\"\n\
+             printf '1\\n/devtools/browser/dummy\\n' > \"$d/DevToolsActivePort\"\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// What `rhd` builds for a sign-in, held open under `root`.
+    #[cfg(unix)]
+    fn signing_in(
+        root: &std::path::Path,
+        chrome: &std::path::Path,
+        name: &str,
+        fresh: bool,
+    ) -> Result<pk_cli_browser::Browser, BrowserError> {
+        browser_launch(name, fresh, true)
+            .unwrap()
+            .profile_root(root)
+            .chrome(chrome)
+            .ctrl_c(false)
+            .spawn()
+    }
+
+    /// The reason the named API exists: two logins run in two profiles, and
+    /// logging out of one leaves the other, with what it holds.
+    #[cfg(unix)]
+    #[test]
+    fn two_logins_keep_separate_profiles_and_logout_leaves_the_other() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        for name in ["dummy-one", "dummy-two"] {
+            drop(signing_in(root.path(), &chrome, name, false).unwrap());
+        }
+        let one = kept_dir(root.path(), "dummy-one");
+        let two = kept_dir(root.path(), "dummy-two");
+        assert!(one.join("stand-in-ran").exists());
+        assert!(two.join("stand-in-ran").exists());
+        assert_ne!(one, two);
+        assert!(
+            !root.path().join("piekstra.rhd/browser-profile").exists(),
+            "a named login must not use the unnamed profile"
+        );
+
+        let forget =
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one");
+        assert!(logout_browser(forget).unwrap());
+        assert!(!one.exists());
+        assert!(
+            two.join("stand-in-ran").exists(),
+            "the other login's profile must stay"
+        );
+        // Nothing left to remove is still a logout.
+        assert!(!logout_browser(forget).unwrap());
+    }
+
+    /// Names that differ only in case are separate logins, and keep separate
+    /// profiles where the filesystem folds case.
+    #[cfg(unix)]
+    #[test]
+    fn names_that_differ_only_in_case_keep_separate_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        for name in ["Dummy", "dummy"] {
+            drop(signing_in(root.path(), &chrome, name, false).unwrap());
+        }
+        let parent = root.path().join("piekstra.rhd");
+        assert!(parent.join("browser-profile-+dummy/stand-in-ran").exists());
+        assert!(parent.join("browser-profile-dummy/stand-in-ran").exists());
+        let forget = || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "Dummy");
+        assert!(logout_browser(forget).unwrap());
+        assert!(!parent.join("browser-profile-+dummy").exists());
+        assert!(parent.join("browser-profile-dummy/stand-in-ran").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_profile_leaves_the_kept_one_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        drop(signing_in(root.path(), &chrome, "dummy-one", true).unwrap());
+        assert!(!kept_dir(root.path(), "dummy-one").exists());
+    }
+
+    /// A profile a sign-in is using is refused with the crate's message, exit
+    /// 1, and left alone, while another login's is not held up by it.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_a_profile_a_sign_in_is_using() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        let holding = signing_in(root.path(), &chrome, "dummy-one", false).unwrap();
+        drop(signing_in(root.path(), &chrome, "dummy-two", false).unwrap());
+
+        let again = signing_in(root.path(), &chrome, "dummy-one", false).unwrap_err();
+        assert!(matches!(again, BrowserError::ProfileInUse(_)), "{again}");
+
+        let forget = |name| pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, name);
+        let err = logout_browser(|| forget("dummy-one")).unwrap_err();
+        assert!(matches!(err, BrowserError::ProfileInUse(_)), "{err}");
+        assert!(err.to_string().contains("log out again"), "{err}");
+        assert!(kept_dir(root.path(), "dummy-one").exists());
+        assert!(logout_browser(|| forget("dummy-two")).unwrap());
+
+        drop(holding);
+        assert!(logout_browser(|| forget("dummy-one")).unwrap());
+        assert!(!kept_dir(root.path(), "dummy-one").exists());
+    }
+
+    /// A profile that needs repair is refused, not followed: a symlink's
+    /// target survives the logout's refusal.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_a_profile_that_needs_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let profile = kept_dir(root.path(), "dummy-one");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &profile).unwrap();
+        let forget =
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one");
+        let err = logout_browser(forget).unwrap_err();
+        assert!(matches!(err, BrowserError::Profile(_)), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(elsewhere.path().exists());
+    }
+
+    /// A name a Chrome profile cannot carry is refused by the login, exit 2
+    /// naming the rule and the way round it, and is never mapped onto another
+    /// login's profile. `--fresh-profile` needs no name, so it still gets in.
+    #[test]
+    fn a_name_no_browser_profile_can_carry_is_refused_not_mapped() {
+        for name in ["has.dot", "has space", "a/b", "", &"a".repeat(65)] {
+            let err = browser_launch(name, false, true).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{name:?}: {err}");
+            let msg = err.to_string();
+            assert!(msg.contains("1 to 64"), "{msg}");
+            assert!(msg.contains("--fresh-profile"), "{msg}");
+            assert!(browser_launch(name, true, true).is_ok(), "{name:?}");
+        }
+    }
+
+    /// Such a name never had a kept profile, so its logout finishes, and
+    /// another login's profile is not touched.
+    #[test]
+    fn logging_out_of_such_a_name_finishes_and_touches_no_other_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let other = kept_dir(root.path(), "has-dot");
+        std::fs::create_dir_all(&other).unwrap();
+        let forget =
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "has.dot");
+        assert!(!logout_browser(forget).unwrap());
+        assert!(other.exists());
+    }
+
+    /// `rhd`'s rule and the crate's must agree, or a name `profiles add` takes
+    /// could fail at the sign-in. The crate's check is not public; a removal
+    /// under a temp dir answers for it.
+    #[test]
+    fn the_name_rule_is_the_browser_crates() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "dummy",
+            "Dummy-2_x",
+            "a",
+            &"a".repeat(64),
+            &"a".repeat(65),
+            "",
+            "has.dot",
+            "has space",
+            "a/b",
+            "ünicode",
+            "..",
+        ] {
+            let crate_refuses = matches!(
+                pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, name),
+                Err(BrowserError::Invalid(_))
+            );
+            assert_eq!(config::profile_name_ok(name), !crate_refuses, "{name:?}");
+        }
+    }
+
+    /// A logout that exits 1 says what is already gone, what remains and how to
+    /// finish, with and without `--forget`.
+    #[test]
+    fn a_refused_logout_says_what_is_cleared_and_how_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let mut cfg = Config::default();
+        cfg.profiles.insert("dummy-one".into(), Default::default());
+
+        let in_use = || {
+            Err(BrowserError::ProfileInUse(
+                "dummy: close that window, then log out again.".into(),
+            ))
+        };
+        let err = finish_logout(&store, &mut cfg, "dummy-one", false, in_use).unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
+        let message = err.to_string();
+        for needle in [
+            "the session of profile `dummy-one` is cleared",
+            "only the browser profile remains",
+            "close that window",
+            "Once that window is closed",
+            "`rhd auth logout --profile dummy-one` again",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+
+        let needs_repair = || Err(BrowserError::Profile("dummy: is a symlink".into()));
+        let err = finish_logout(&store, &mut cfg, "dummy-one", true, needs_repair).unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
+        let message = err.to_string();
+        for needle in [
+            "the session and stored credentials of profile `dummy-one` are cleared",
+            "the browser profile and this login's config entry remain",
+            "symlink",
+            "Repair or delete that path",
+            "`rhd auth logout --forget --profile dummy-one` again",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+    }
+
+    /// `--forget` drops the login from the config only once the browser
+    /// profile is gone: a refusal leaves it configured, because the retry the
+    /// message asks for would otherwise answer "no login profile named".
+    #[test]
+    fn a_refused_forget_leaves_the_login_configured_for_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let mut cfg = Config {
+            default_profile: Some("dummy-one".into()),
+            ..Config::default()
+        };
+        cfg.profiles.insert("dummy-one".into(), Default::default());
+        store.save(&cfg).unwrap();
+
+        let err = finish_logout(&store, &mut cfg, "dummy-one", true, || {
+            Err(BrowserError::ProfileInUse(
+                "dummy: close that window".into(),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let saved: Config = store.load().unwrap();
+        assert!(saved.profiles.contains_key("dummy-one"));
+
+        assert!(!finish_logout(&store, &mut cfg, "dummy-one", true, || Ok(false)).unwrap());
+        let saved: Config = store.load().unwrap();
+        assert!(!saved.profiles.contains_key("dummy-one"));
+        assert_eq!(saved.default_profile, None);
+    }
+
+    #[test]
+    fn the_logout_line_says_what_went() {
+        assert_eq!(
+            logged_out("dummy", false, false),
+            "logged out of profile `dummy`"
+        );
+        assert_eq!(
+            logged_out("dummy", true, true),
+            "logged out of profile `dummy` and forgot its stored credentials; browser profile removed"
+        );
     }
 
     /// A 401 on the proving read stays an auth failure (exit 3), names the

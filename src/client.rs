@@ -230,8 +230,15 @@ impl Tokens {
     /// A session with no known expiry is reported usable — the server stays
     /// the authority, and guessing "expired" would force a needless login.
     pub fn is_expired(&self) -> bool {
+        self.is_expired_at(now_unix())
+    }
+
+    /// [`Tokens::is_expired`] at `now`: the rule a renewal goes by, so a caller
+    /// checking whether a token may already have been renewed asks the same
+    /// question.
+    pub fn is_expired_at(&self, now: u64) -> bool {
         match self.expires_at {
-            Some(exp) => exp.saturating_sub(60) <= now_unix(),
+            Some(exp) => exp.saturating_sub(60) <= now,
             None => false,
         }
     }
@@ -1063,24 +1070,34 @@ fn read_json(resp: reqwest::blocking::Response) -> Result<Value, ReadFailure> {
 
 /// Classify a response from its parts. Pure, so the mapping is testable
 /// without a network.
-fn classify(
+pub(crate) fn classify(
     status: u16,
     url: &str,
     retry_after: Option<String>,
     text: &str,
 ) -> Result<Value, ReadFailure> {
+    let body = || serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    // A throttle or an outage says nothing about the session, whatever its body,
+    // and an edge answers both with HTML. Read as a refusal, it would renew the
+    // session for nothing, and leave a browser sign-in waiting out its timeout on
+    // a session that may be live.
+    if status == 429 {
+        return Err(ReadFailure::Throttled { retry_after });
+    }
+    if (500..600).contains(&status) {
+        return Err(ReadFailure::Upstream(format!(
+            "Robinhood returned HTTP {status}{}",
+            detail_suffix(&body())
+        )));
+    }
     // A lapsed session frequently comes back as a login page with a 200, not a
-    // 401 — so shape, not status, decides.
+    // 401 — so from here shape, not status, decides.
     if looks_like_html(text) {
         return Err(ReadFailure::Html {
             status,
             url: url.to_string(),
         });
     }
-    if status == 429 {
-        return Err(ReadFailure::Throttled { retry_after });
-    }
-    let body = || serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
     if status == 401 || status == 403 {
         return Err(ReadFailure::Rejected {
             status,
@@ -1670,6 +1687,18 @@ mod tests {
         let down = classify(503, url, None, r#"{"detail":"maintenance"}"#).unwrap_err();
         assert_eq!(down.cause(), "Robinhood returned HTTP 503: maintenance");
         assert_eq!(down.into_cli_error().exit_code(), 5);
+
+        // A throttle or an outage is no verdict on the session, whatever its
+        // body. HTML on any other status still reads as a refusal.
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let throttled = classify(429, url, Some("51".into()), PAGE).unwrap_err();
+        assert!(matches!(throttled, ReadFailure::Throttled { .. }));
+        for status in [500, 502, 503, 504] {
+            let down = classify(status, url, None, PAGE).unwrap_err();
+            assert!(!down.is_auth(), "{status}");
+            assert_eq!(down.into_cli_error().exit_code(), 5, "{status}");
+        }
+        assert!(classify(403, url, None, PAGE).unwrap_err().is_auth());
 
         assert_eq!(
             classify(200, url, None, r#"{"results":[]}"#).unwrap(),

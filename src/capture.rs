@@ -16,8 +16,8 @@
 //!   when the token expires. Only `--session-stdin` takes this shape.
 //!
 //! Two ways in, one parser. `--browser` reads the stored session out of a
-//! scratch Chrome the owner signs in through ([`browser_capture`], over the
-//! DevTools protocol with `pk-cli-browser`); `--session-stdin` reads what
+//! Chrome the owner signs in through ([`browser_capture`], over the DevTools
+//! protocol with `pk-cli-browser`); `--session-stdin` reads what
 //! the owner copied out of DevTools. Both hand the text to [`parse`], so they
 //! store identical credentials.
 //!
@@ -57,6 +57,14 @@ const DEVICE_COOKIE_URL: &str = "https://robinhood.com/";
 /// (accepted double-encoded) as JSON with the `device_id` cookie added as
 /// `device_token`, or `device_token: null` when `document.cookie` cannot see
 /// it: what the Console snippet in `--session-stdin`'s help copies.
+///
+/// It takes `web:auth_state` out of `localStorage` as it reads, because the
+/// profile outlives the window. Refresh tokens rotate on every use, so a copy
+/// left there goes stale at `rhd`'s next renewal: the next window would hand it
+/// over, or the web app would present it and put the session `rhd` holds at
+/// risk. So the kept profile keeps the cookies (the `device_id` that remembers
+/// this device) and not the tokens, and the page starts signed out. The Console
+/// snippet stays read-only: it runs in the owner's own browser.
 pub const SESSION_EXPRESSION: &str = "(() => { \
     const raw = localStorage['web:auth_state']; \
     if (!raw) return null; \
@@ -64,6 +72,7 @@ pub const SESSION_EXPRESSION: &str = "(() => { \
     try { s = JSON.parse(raw); if (typeof s === 'string') s = JSON.parse(s); } catch { return null; } \
     if (!s || !s.access_token) return null; \
     const d = (document.cookie.match(/(?:^|; )device_id=([^;]+)/) || [])[1]; \
+    localStorage.removeItem('web:auth_state'); \
     return JSON.stringify({ ...s, device_token: d || null }); \
 })()";
 
@@ -200,8 +209,9 @@ pub fn parse(raw: &str, now: u64, source: Source) -> Result<Captured, CliError> 
 
     // An expired token would only spend the proving read on a certain 401.
     // The web app renews its own session when the page loads, so reloading
-    // the tab and capturing again is the remedy; a session the sign-in
-    // window just handed over can only be expired by a wrong clock.
+    // the tab and capturing again is the remedy. In a sign-in window this is
+    // a session a kept profile still held as the page opened, so the capture
+    // goes on waiting and this is what its timeout reports.
     if let Some(exp) = captured.tokens.expires_at {
         if exp <= now {
             let again = match source {
@@ -209,7 +219,9 @@ pub fn parse(raw: &str, now: u64, source: Source) -> Result<Captured, CliError> 
                     "reload robinhood.com, which renews its session, and capture again"
                 }
                 Source::Browser => {
-                    "check this machine's clock, then sign in again with `rhd auth login --browser`"
+                    "the window still held an old session and no new sign-in finished; sign in \
+                     again with `rhd auth login --browser`, and check this machine's clock if a \
+                     new session looks expired too"
                 }
             };
             return Err(CliError::Auth(format!(
@@ -364,7 +376,7 @@ fn is_uuid(s: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -380,7 +392,7 @@ mod tests {
     /// An unsigned JWT carrying `claims`. The header segment is a plain word
     /// rather than base64 JSON: nothing reads it, and a realistic one would
     /// make this file trip secret scanners.
-    fn jwt(claims: &Value) -> String {
+    pub(crate) fn jwt(claims: &Value) -> String {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let bytes = serde_json::to_vec(claims).unwrap();
         let mut payload = String::new();
@@ -680,6 +692,21 @@ mod tests {
         assert!(SESSION_EXPRESSION.contains("device_token: d || null"));
     }
 
+    /// The kept profile must not hold the session afterwards, and nothing is
+    /// removed before the session is known to be there.
+    #[test]
+    fn the_expression_takes_the_session_out_of_the_profile() {
+        let removal = format!("localStorage.removeItem('{AUTH_STATE_KEY}')");
+        let at = SESSION_EXPRESSION.find(&removal).expect("the removal");
+        assert!(
+            SESSION_EXPRESSION
+                .find("!s.access_token) return null")
+                .unwrap()
+                < at
+        );
+        assert_eq!(SESSION_EXPRESSION.matches("removeItem").count(), 1);
+    }
+
     /// The jar's cookie fills the device the page could not read, and the
     /// result is what the existing parser accepts: the same tokens a paste
     /// of that session with its device id gives, so `--browser` and
@@ -764,8 +791,8 @@ mod tests {
         }
     }
 
-    /// A session the window just handed over can only be expired by a
-    /// wrong clock; the remedy is the browser sign-in, not a reload.
+    /// An expired session in the window is an old one the kept profile held;
+    /// the remedy is the browser sign-in, not a reload.
     #[test]
     fn an_expired_browser_session_points_at_the_browser_login() {
         let mut v: Value = serde_json::from_str(BROWSER_SESSION).unwrap();

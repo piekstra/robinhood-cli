@@ -57,6 +57,18 @@ pub const PROFILE_ENV: &str = "RHD_PROFILE";
 /// Env var naming the active brokerage account number.
 pub const ACCOUNT_ENV: &str = "RHD_ACCOUNT";
 
+/// Whether `name` can be a login profile: 1 to 64 ASCII letters, digits, `-` or
+/// `_`. It becomes part of a keychain entry name and names the Chrome profile
+/// a browser sign-in keeps for it, whose rule this is
+/// (`pk_cli_browser::Launch::profile_name`, which checks a name and never
+/// rewrites it).
+pub fn profile_name_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Keychain account for a profile's password.
 pub fn password_key(profile: &str) -> String {
     format!("{profile}/password")

@@ -140,8 +140,8 @@ enum AuthCmd {
     /// Sign in through a Chrome window with --browser; --session-stdin and
     /// the password login are the fallbacks.
     ///
-    /// --browser opens https://robinhood.com/login in a throwaway Chrome
-    /// profile. You sign in there, and rhd reads the session the web app
+    /// --browser opens https://robinhood.com/login in a Chrome profile rhd
+    /// keeps for this login. You sign in there, and rhd takes the session the web app
     /// stores, closes the window, proves the session with one read of your
     /// accounts, and keeps it in the OS keychain (docs/api.md §2.8).
     ///
@@ -152,7 +152,9 @@ enum AuthCmd {
     Login(RhLoginArgs),
     /// Report credential/session state (auth-status/v1).
     Status(StatusArgs),
-    /// Clear the cached session; --forget also removes stored credentials.
+    /// Clear the cached session, then remove the kept browser profile; --forget
+    /// also removes stored credentials. While Chrome is using the profile this
+    /// exits 1 with the rest already cleared and only the profile left.
     Logout(LogoutArgs),
     /// Raw keychain write for rotation / headless setup.
     SetCredential(SetCredentialArgs),
@@ -166,9 +168,18 @@ enum AuthCmd {
 /// CLI's long help and refuses every other credential source and every
 /// password-login flag beside it at parse time (exit 2), before any config,
 /// keychain or network work.
+///
+/// `--fresh-profile` needs the same list of its own. Its `requires = "browser"`
+/// does not hold once one of these is present: clap counts a required argument
+/// as satisfied when it conflicts with an argument given, so
+/// `--session-stdin --fresh-profile` would parse and run the import.
 #[derive(clap::Args, Debug)]
 #[command(mut_arg("browser", |a| a
     .long_help(BROWSER_HELP)
+    .conflicts_with_all([
+        "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
+    ])))]
+#[command(mut_arg("fresh_profile", |a| a
     .conflicts_with_all([
         "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
     ])))]
@@ -215,14 +226,22 @@ const BROWSER_HELP: &str = "\
 Sign in through a Chrome window and capture the session from it: the
 password and any code are entered on Robinhood's own page, never in rhd.
 
-rhd starts Chrome with a throwaway profile at https://robinhood.com/login.
-Sign in there, answering any code or approval Robinhood asks for. Once
-the robinhood.com page holds a session, rhd reads it from that page only
+rhd starts Chrome at https://robinhood.com/login in a profile it keeps for
+this login, separate from every other login's. Sign in there, answering any
+code or approval Robinhood asks for. Once the robinhood.com page holds a
+session Robinhood accepts, rhd takes it from that page only
 (localStorage['web:auth_state'], plus the device_id cookie) and closes
 the tab at once, so the web app cannot renew the session out from under
-rhd. Then it quits Chrome, deletes the profile, reads your accounts once
-with the session, and stores it in the OS keychain only if that read
-succeeds. It never prints the token.
+rhd. Then it quits Chrome, reads your accounts once with the session, and
+stores it in the OS keychain only if that read succeeds. It never prints
+the token.
+
+The kept profile lets Robinhood remember this device, so a later sign-in
+often asks for less. rhd takes the session out of it, but it is a full
+Chrome profile, owner-only on disk: Robinhood's cookies, browsing history
+with full URLs, the HTTP cache and site storage stay, after a failed sign-in
+too, until `rhd auth logout` removes it. --fresh-profile signs in through a
+scratch profile instead.
 
 Waits up to 10 minutes; Ctrl-C cancels. Chrome, Chromium or Edge is found
 at the standard install paths; set RHD_CHROME to use another binary.
@@ -293,7 +312,8 @@ enum ProfilesCmd {
         #[arg(long, value_name = "ID")]
         account: Option<String>,
     },
-    /// Remove a login profile and its stored credentials.
+    /// Remove a login profile, its stored credentials and its kept browser
+    /// profile.
     Remove {
         name: String,
         /// Remove without confirmation.
@@ -741,7 +761,8 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Resul
     let profile = cfg.require_profile(cli.profile.as_deref())?;
     match cmd {
         AuthCmd::Login(args) if args.browser.browser => {
-            commands::auth::browser_login(&cli.common, store, cfg, &profile)
+            let fresh_profile = args.browser.fresh_profile;
+            commands::auth::browser_login(&cli.common, store, cfg, &profile, fresh_profile)
         }
         AuthCmd::Login(args) if args.session_stdin => commands::auth::import_session(
             &cli.common,

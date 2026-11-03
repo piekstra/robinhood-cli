@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.15.1"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.17.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -63,7 +63,9 @@ Tests are **fully offline**: no network, no keychain, no credentials, and no
 Chrome. Keep them that way (see "Costing the credential loop" below). The
 `--browser` tests stop at clap's flag conflicts or at an `RHD_CHROME` that
 does not exist; the capture itself is checked with `Capture::validate` and a
-scrubbed fixture of the expression's answer.
+scrubbed fixture of the expression's answer, the confirm hook on captures built
+by hand, and profile selection and the in-use lock with a shell-script stand-in
+for Chrome under a temp root (`Launch::profile_root`).
 
 ## Layout
 
@@ -154,7 +156,8 @@ These are the ones that cost real debugging time elsewhere in the family:
 
 - **Never report success from a status code alone.** A `200` carrying an HTML
   login page is an auth failure. Treat "HTML where JSON was expected" and
-  "landed on a login URL" as `CliError::Auth`, not success.
+  "landed on a login URL" as `CliError::Auth`, not success. A 429 or a 5xx is not
+  that, whatever its body: it says nothing about the session.
 - **A download is not a document until it matches its declared `filetype`.**
   `%PDF` magic for a PDF; for text filetypes (`csv`, `html` exist live), none
   of the known failure shapes — a DRF JSON error, an S3 XML error, HTML where
@@ -189,11 +192,38 @@ and a rate-limited one.
 - **Sign in through the browser** (`auth login --browser`, docs/api.md §2.8)
   rather than retrying the password login. Live on 2026-10-27 the password
   login re-challenged on every attempt and no prompt reached the phone.
-  `--browser` opens Chrome at robinhood.com/login with a throwaway profile,
-  the owner signs in on Robinhood's page, and `rhd` reads the stored session,
+  `--browser` opens Chrome at robinhood.com/login in a profile kept per login,
+  the owner signs in on Robinhood's page, and `rhd` takes the stored session,
   closes the tab at once (so the web app cannot rotate the refresh token it
   shares with `rhd`, or log it out), and spends one ordinary read proving it.
   It needs the owner at the window: never run it unattended or from a test.
+- **The kept browser profile.** `Launch::profile_name(<login>)` keeps one per
+  login profile, so one household account's sign-in never opens signed in as
+  another, and `--fresh-profile` opts out for one run. A retired refresh token
+  must never stay where the next window reads or presents it, so
+  `capture::SESSION_EXPRESSION` takes `web:auth_state` out of `localStorage` as it
+  reads, and `commands::auth::confirm_candidate` lets the tab close only on a
+  session short of `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood
+  accepts.
+  Keep both gates: without them a re-login reads the old session, closes the window
+  and fails, run after run. The Console snippet stays read-only: it runs in the
+  owner's own browser.
+- **It is a full Chrome profile** (history with full URLs, HTTP cache, site
+  storage), `0700` its only protection beyond Chrome's cookie encryption, which on
+  Linux with no desktop keyring uses a fixed, publicly known key. It outlives a
+  failed sign-in, so every failure from the window on says so: they all pass through
+  `through_the_window` into `failed_sign_in`, so add a new step there. `auth status`
+  does not report it: cli-common has no public way to ask whether one exists.
+- **A read that cannot decide ends the wait.** In `confirm_candidate` a 429 or a
+  5xx is `Confirm::Fail`, whatever its body (`client::classify` reads those statuses
+  before the HTML), and only an accounts list is `Ready`.
+- **`auth logout` and `profiles remove` remove the login's kept profile, and no
+  test may reach the real one.** The removal goes through the `logout_browser` seam:
+  the binary binds `forget_named_profile(BIN, name)`, tests bind
+  `forget_named_profile_in` under a temp dir (`pk-cli-browser`'s `test-util`, a
+  dev-dependency only). It runs after the keychain and before the config entry, so a
+  refusal (`ProfileInUse`, `Profile`; exit 1) leaves the credentials cleared and the
+  retry able to find the login, and its error says so (`logout_refused`).
   `--session-stdin` is the fallback (a session copied out of DevTools), and
   goes through the same parser, proof and keychain item. Either bundle
   carries its own `origin` and the browser's `device_token`, and renews with

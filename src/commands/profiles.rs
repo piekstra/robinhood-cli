@@ -3,6 +3,7 @@
 //! See `config.rs` for why a "profile" here is a *login identity* and not a
 //! `cli-common` domain profile.
 
+use pk_cli_browser::BrowserError;
 use pk_cli_config::ConfigStore;
 use pk_cli_core::{CliError, CommonArgs, Paged};
 use pk_cli_secrets::CredentialStore;
@@ -98,11 +99,13 @@ pub fn add(
     Ok(())
 }
 
-/// Remove a profile and every keychain entry belonging to it.
+/// Remove a profile, every keychain entry belonging to it and the Chrome
+/// profile its browser sign-ins keep, so a later login under the same name
+/// never opens already signed in as this one.
 pub fn remove(
     common: &CommonArgs,
     store: &ConfigStore,
-    mut cfg: Config,
+    cfg: Config,
     name: &str,
     force: bool,
 ) -> Result<(), CliError> {
@@ -117,10 +120,11 @@ pub fn remove(
     if !force {
         if !common.interactive() {
             return Err(CliError::ConfirmationRequired(format!(
-                "removing profile `{name}` deletes its stored credentials — pass --force"
+                "removing profile `{name}` deletes its stored credentials and kept browser \
+                 profile — pass --force"
             )));
         }
-        eprint!("Remove profile `{name}` and its stored credentials? [y/N] ");
+        eprint!("Remove profile `{name}`, its stored credentials and kept browser profile? [y/N] ");
         if !confirm()? {
             return Err(CliError::Other("aborted".into()));
         }
@@ -136,6 +140,42 @@ pub fn remove(
         creds.delete(&key)?;
     }
 
+    let browser = drop_profile(store, cfg, name, || {
+        pk_cli_browser::forget_named_profile(config::BIN, name)
+    })?;
+    if !common.quiet {
+        eprintln!(
+            "profile `{name}` removed{}",
+            if browser {
+                "; browser profile removed"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+/// A removal's steps past the keychain; `true` when there was a browser
+/// profile to remove. The browser profile goes before the config entry: a
+/// refusal (its window still open) leaves the credentials cleared and asks for
+/// another try, which has to find the profile still configured. The removal is
+/// passed in so a test never reaches the owner's real profile
+/// ([`crate::commands::auth::logout_browser`]).
+fn drop_profile(
+    store: &ConfigStore,
+    mut cfg: Config,
+    name: &str,
+    forget_browser: impl FnOnce() -> Result<bool, BrowserError>,
+) -> Result<bool, CliError> {
+    let browser = crate::commands::auth::logout_browser(forget_browser).map_err(|e| {
+        crate::commands::auth::logout_refused(
+            &format!("the session and stored credentials of profile `{name}` are cleared"),
+            "the browser profile and this login's config entry remain",
+            &format!("rhd profiles remove {name} --force"),
+            &e,
+        )
+    })?;
     cfg.profiles.remove(name);
     if cfg.default_profile.as_deref() == Some(name) {
         // Promote the sole survivor, if there is exactly one; otherwise leave
@@ -145,10 +185,7 @@ pub fn remove(
             .flatten();
     }
     store.save(&cfg)?;
-    if !common.quiet {
-        eprintln!("profile `{name}` removed");
-    }
-    Ok(())
+    Ok(browser)
 }
 
 /// Make `name` the default profile.
@@ -173,18 +210,16 @@ pub fn use_profile(
 }
 
 /// Profile names become keychain account keys (`<name>/password`), so a name
-/// containing `/` would let one profile's entries collide with another's.
+/// containing `/` would let one profile's entries collide with another's, and
+/// they name the Chrome profile a browser sign-in keeps.
 fn validate_name(name: &str) -> Result<(), CliError> {
     if name.is_empty() {
         return Err(CliError::Usage("profile name must not be empty".into()));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !config::profile_name_ok(name) {
         return Err(CliError::Usage(format!(
-            "profile name `{name}` must use only letters, digits, `-`, or `_` \
-             (it becomes part of a keychain entry name)"
+            "profile name `{name}` must be at most 64 letters, digits, `-`, or `_` \
+             (it becomes part of a keychain entry name and a Chrome profile's directory)"
         )));
     }
     Ok(())
@@ -215,6 +250,70 @@ mod tests {
         assert!(validate_name("spouse joint").is_err());
         assert!(validate_name("primary").is_ok());
         assert!(validate_name("spouse-roth_2").is_ok());
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_browser_profile_is_rejected() {
+        assert!(validate_name(&"a".repeat(64)).is_ok());
+        assert!(validate_name(&"a".repeat(65)).is_err());
+    }
+
+    fn config_with(names: &[&str], default: &str) -> Config {
+        let mut cfg = Config {
+            default_profile: Some(default.into()),
+            ..Config::default()
+        };
+        for name in names {
+            cfg.profiles.insert((*name).into(), Default::default());
+        }
+        cfg
+    }
+
+    /// Removing a profile removes its browser profile only. A refusal (its
+    /// window still open) leaves it configured, so the retry the message asks
+    /// for finds it.
+    #[test]
+    fn removing_a_profile_removes_its_browser_profile_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let cfg = config_with(&["dummy-one", "dummy-two"], "dummy-one");
+        store.save(&cfg).unwrap();
+
+        let in_use = drop_profile(&store, cfg, "dummy-one", || {
+            Err(BrowserError::ProfileInUse(
+                "dummy: close that window".into(),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(in_use.exit_code(), 1);
+        let message = in_use.to_string();
+        for needle in [
+            "stored credentials of profile `dummy-one` are cleared",
+            "the browser profile and this login's config entry remain",
+            "`rhd profiles remove dummy-one --force` again",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        let cfg: Config = store.load().unwrap();
+        assert!(
+            cfg.profiles.contains_key("dummy-one"),
+            "must stay for the retry"
+        );
+
+        let profiles = dir.path().join("root");
+        let one = profiles.join("piekstra.rhd/browser-profile-dummy-one");
+        let two = profiles.join("piekstra.rhd/browser-profile-dummy-two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let forget =
+            || pk_cli_browser::forget_named_profile_in(&profiles, config::BIN, "dummy-one");
+        assert!(drop_profile(&store, cfg, "dummy-one", forget).unwrap());
+        assert!(!one.exists());
+        assert!(two.exists());
+
+        let cfg: Config = store.load().unwrap();
+        assert!(!cfg.profiles.contains_key("dummy-one"));
+        assert_eq!(cfg.default_profile.as_deref(), Some("dummy-two"));
     }
 
     #[test]
