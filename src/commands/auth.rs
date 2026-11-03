@@ -222,7 +222,7 @@ fn finish(
 
     if !common.quiet {
         eprintln!(
-            "logged in as {username} (profile `{profile}`) — {} account{} visible",
+            "logged in (profile `{profile}`) — {} account{} visible",
             accounts.len(),
             if accounts.len() == 1 { "" } else { "s" }
         );

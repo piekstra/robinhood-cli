@@ -5,6 +5,7 @@
 A browser sign-in now runs in a profile `rhd` keeps per login, where it used to run
 in a scratch profile deleted after every sign-in. Moves to cli-common v0.20.0.
 
+- `rhd auth login` no longer prints the username on stderr, which can end up in a log or an agent's transcript. It still names the profile and the account count.
 - `rhd auth login --browser` keeps a Chrome profile on disk for each login profile,
   owner-only (`0700`), at
   `~/Library/Application Support/piekstra.rhd/browser-profile-<NAME>` on macOS and

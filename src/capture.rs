@@ -617,7 +617,7 @@ pub(crate) mod tests {
             v["read_only_secondary_access_token"].as_str().unwrap(),
             DEVICE,
         ] {
-            assert!(!shown.contains(secret), "Debug printed {secret}: {shown}");
+            assert!(!shown.contains(secret), "Debug printed a secret");
         }
 
         let bearer = parse(

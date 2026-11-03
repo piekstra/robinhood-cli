@@ -1738,7 +1738,7 @@ mod tests {
             "SAMPLE-READONLY-SECRET",
             "d0d0",
         ] {
-            assert!(!shown.contains(secret), "Debug printed {secret}: {shown}");
+            assert!(!shown.contains(secret), "Debug printed a secret");
         }
         // Still useful for debugging: the non-secret fields show.
         assert!(shown.contains("WebAuthState"), "{shown}");
