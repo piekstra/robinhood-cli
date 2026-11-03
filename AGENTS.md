@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.17.0"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.18.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -116,7 +116,10 @@ token, and two refreshing at once would present the same one twice, so
 (`~/.config/rhd/token-refresh.lock`, holding nothing) against every other
 `rhd` process, re-reads the session once it holds the lock, and posts no grant
 if the session is no longer expired. A login and a logout hold it around their
-keychain write only, never across the sign-in.
+keychain write only, never across the sign-in: a login checks it first
+(`RefreshLock::before_signin`) and stores through `auth::store_session`, and a
+logout's or `profiles remove`'s delete runs with or without it
+(`auth::forget_session`).
 The tools never sign in: an auth error asks the user to run
 `rhd auth login --browser --profile <NAME>` in a terminal. A profile that
 cannot be chosen (several, no default) fails each call, not the server.
@@ -147,8 +150,9 @@ cannot be chosen (several, no default) fails each call, not the server.
   ever added, the README's read-only claim changes in the *same* commit.
 - **`--json` on every command**, exactly one DTO per invocation, `schema`
   tagged. Human output to stdout, diagnostics to stderr.
-- **Exit codes**: 0 ok · 2 usage · 3 auth · 4 not found · 5 upstream ·
-  6 confirmation required.
+- **Exit codes**: 0 ok · 2 usage · 3 auth · 4 not found · 5 upstream, or another
+  `rhd` process holding the token-refresh lock past the wait · 6 confirmation
+  required.
 - **Validate args before touching keychain or network**, so `--help` and bad
   input never prompt, hang, or hit the provider.
 - **Secrets only** from the OS keychain (`piekstra.rhd`), stdin, or a named

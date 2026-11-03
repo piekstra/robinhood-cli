@@ -129,12 +129,14 @@ pub fn remove(
     let creds = CredentialStore::for_binary(config::BIN);
     for key in [
         config::password_key(name),
-        config::token_key(name),
         config::device_key(name),
         config::pending_key(name),
     ] {
         creds.delete(&key)?;
     }
+    // Last: past a held lock this deletes and asks to be run again, which needs
+    // the profile still in the config.
+    super::auth::forget_session(&creds, name)?;
 
     cfg.profiles.remove(name);
     if cfg.default_profile.as_deref() == Some(name) {

@@ -214,7 +214,9 @@ under an exclusive lock on `~/.config/rhd/token-refresh.lock` (an empty file;
 reads the session again once it holds the lock, and if the session is no longer
 expired another process has renewed: it posts no grant and uses that process's
 tokens. A wait is bounded at 75 s, then exit 5 naming the lock, with nothing
-sent. All profiles share the one lock.
+sent. All profiles share the one lock. It only excludes copies that take it, so the
+protection starts once every copy is 0.4.2 or later, including a server not yet
+restarted and an installed Claude Desktop extension, which bundles its own binary.
 
 The `device_token` sent is the one the session was issued to. For a password
 session that is the profile's `<profile>/device`; for a session from a browser

@@ -49,7 +49,9 @@ per profile:
 
 One file sits beside them and holds nothing: `~/.config/rhd/token-refresh.lock`
 is empty, and `rhd` processes hold it while renewing a session, so two never
-present one refresh token.
+present one refresh token. That holds once every copy sharing the keychain items
+is 0.4.2 or later, including a server not yet restarted and an installed Claude
+Desktop extension, which bundles its own binary.
 
 Additionally, **document URLs returned by the API are pre-signed** and grant
 access to a tax form or statement without a bearer token. Never paste one into
@@ -133,7 +135,12 @@ from the config.
 
 `rhd auth logout` removes this machine's copy of the session; to end it at
 Robinhood, change your password or sign out of other devices in Robinhood's own
-app. It does not touch `mcp-http-token` and does not stop `rhd mcp --http`. The
+app. The delete runs even when the refresh lock is unavailable. If another process
+has held the lock past the wait, `rhd auth logout` and `rhd profiles remove` delete
+the session and exit 5 saying so, because a renewal in flight can store it again.
+Run the command again in a minute to settle it.
+
+`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`. The
 server stays up, its callers get auth errors, and **a later login silently
 restores the token holder's access**. Revoke that access separately:
 

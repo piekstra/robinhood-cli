@@ -333,6 +333,10 @@ version.
 $ launchctl kickstart -k gui/$(id -u)/com.piekstra.rhd-mcp-http
 ```
 
+`self-update` does not reach a Claude Desktop extension, which runs its own copy.
+Install the new release's `.mcpb` too. A server or extension on an older version
+renews without the lock the others use, which can cost a sign-in.
+
 ## Security
 
 Passwords, OAuth tokens (including a session from a browser), and device
