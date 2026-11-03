@@ -10,10 +10,12 @@
 //! - **Park, don't re-ask.** When a challenge is raised without a TTY to
 //!   prompt on, the in-flight attempt is stored and the user resumes it with
 //!   `--code`. A code is bound to the attempt that requested it.
-//! - **Prove before storing.** A session is only written to the keychain
-//!   after a real read succeeds with it, so a login that authenticates but
-//!   can't fetch anything leaves nothing broken behind. That holds for a
-//!   session from a browser (`--browser`, `--session-stdin`) too.
+//! - **Prove before storing.** `--session-stdin` and the password login write a
+//!   session to the keychain only after a real read succeeds with it, so a login that
+//!   authenticates but can't fetch anything leaves nothing broken behind. `--browser` is
+//!   the named exception: its session is stored unless Robinhood definitely refuses it,
+//!   and unverified with a warning when the read cannot decide, because the page held
+//!   the only copy ([`confirm_candidate`]).
 //! - **A window's tokens do not stay.** `--browser` runs Chrome in a profile kept per
 //!   login, so a re-login often asks for less. The page keeps the tokens in
 //!   `localStorage`, so [`browser_launch`] turns on `clear_site_storage`. The capture
@@ -353,7 +355,15 @@ fn chrome_is_missing(named: Option<std::ffi::OsString>) -> bool {
 struct WindowMemory {
     refused: Mutex<Option<Refused>>,
     accepted: Mutex<Option<Value>>,
-    unverified: Mutex<Option<String>>,
+    unverified: Mutex<Option<Undecided>>,
+}
+
+/// Why a read could not decide on the session it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Undecided {
+    why: String,
+    /// The answer was shaped like a block at the edge, so a new sign-in comes last.
+    edge: bool,
 }
 
 /// A token Robinhood refused, and what the read said.
@@ -534,7 +544,13 @@ fn confirm_candidate(
             *memory.accepted.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
             Confirm::Ready
         }
-        Ok(_) => take_unverified(memory, no_accounts_list().cause()),
+        Ok(_) => take_unverified(
+            memory,
+            Undecided {
+                why: no_accounts_list().cause(),
+                edge: false,
+            },
+        ),
         Err(failure) => match failure.definite_refusal() {
             Some(reason) => {
                 *refused = Some(Refused {
@@ -543,14 +559,20 @@ fn confirm_candidate(
                 });
                 Confirm::NotYet(reason)
             }
-            None => take_unverified(memory, failure.inconclusive_cause()),
+            None => take_unverified(
+                memory,
+                Undecided {
+                    why: failure.inconclusive_cause(),
+                    edge: failure.is_edge_shaped(),
+                },
+            ),
         },
     }
 }
 
 /// End the wait with the session taken, remembering why it is unverified.
-fn take_unverified(memory: &WindowMemory, why: String) -> Confirm {
-    *memory.unverified.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+fn take_unverified(memory: &WindowMemory, undecided: Undecided) -> Confirm {
+    *memory.unverified.lock().unwrap_or_else(|e| e.into_inner()) = Some(undecided);
     Confirm::Ready
 }
 
@@ -645,7 +667,7 @@ struct CheckedImport {
     tokens: Tokens,
     visible: Vec<Value>,
     more: bool,
-    unverified: Option<String>,
+    unverified: Option<Undecided>,
 }
 
 impl CheckedImport {
@@ -667,7 +689,7 @@ impl CheckedImport {
 
 /// A session from the window that its one read could not decide on: no page was read,
 /// so it holds no accounts.
-fn unverified_import(raw: &Secret, why: String) -> Result<CheckedImport, CliError> {
+fn unverified_import(raw: &Secret, undecided: Undecided) -> Result<CheckedImport, CliError> {
     let Captured { shape, tokens } =
         capture::parse(raw.expose(), crate::client::now_unix(), Source::Browser)?;
     Ok(CheckedImport {
@@ -676,7 +698,7 @@ fn unverified_import(raw: &Secret, why: String) -> Result<CheckedImport, CliErro
         tokens,
         visible: Vec::new(),
         more: false,
-        unverified: Some(why),
+        unverified: Some(undecided),
     })
 }
 
@@ -729,22 +751,28 @@ fn store_import(
     if common.json {
         crate::commands::emit_one("session-import/v1", &report, true);
     }
-    for note in report.notes(common, checked.unverified.as_deref()) {
+    for note in report.notes(common, checked.unverified.as_ref()) {
         eprintln!("{note}");
     }
     Ok(())
 }
 
-/// `auth status` makes no request, so it is not what tests the session. An answer such
-/// as an HTML 403 or an empty 2xx can repeat on every later read, and then only a new
-/// sign-in gets past it, so this names that way out.
-fn unverified_warning(why: &str, profile: &str) -> String {
-    format!(
-        "the sign-in is kept, but its session is stored unverified: {}. A later read, such as \
-         `rhd accounts list --profile {profile}`, may settle it; if reads keep failing, run \
-         `rhd auth login --browser --overwrite --profile {profile}`.",
-        why.trim_end_matches('.')
-    )
+/// `auth status` makes no request, so it is not what tests the session. A throttle or an
+/// outage can clear by the next read, and if reads keep failing, a new sign-in is the
+/// next thing to try. A block at the edge can repeat on every read whatever the session,
+/// and a new sign-in does not get past it, so there the sign-in comes last.
+fn unverified_warning(undecided: &Undecided, profile: &str) -> String {
+    let why = undecided.why.trim_end_matches('.');
+    let login = format!("rhd auth login --browser --overwrite --profile {profile}");
+    let next = if undecided.edge {
+        crate::client::edge_block_advice(&login)
+    } else {
+        format!(
+            "A later read, such as `rhd accounts list --profile {profile}`, may settle it; if \
+             reads keep failing, run `{login}`."
+        )
+    };
+    format!("the sign-in is kept, but its session is stored unverified: {why}. {next}")
 }
 
 /// What `--browser` or `--session-stdin` stored, without a single token
@@ -779,7 +807,7 @@ struct SessionImport {
 impl SessionImport {
     /// What goes to stderr. The warning comes under `-q` and `--json` too: nothing has
     /// shown that session works.
-    fn notes(&self, common: &CommonArgs, unverified: Option<&str>) -> Vec<String> {
+    fn notes(&self, common: &CommonArgs, unverified: Option<&Undecided>) -> Vec<String> {
         let mut notes: Vec<String> = unverified
             .map(|why| format!("warning: {}", unverified_warning(why, &self.profile)))
             .into_iter()
@@ -1511,6 +1539,13 @@ mod tests {
         }
     }
 
+    fn undecided(why: &str) -> Undecided {
+        Undecided {
+            why: why.into(),
+            edge: false,
+        }
+    }
+
     /// The result always carries `verified` as a boolean, so `jq '.verified == true'`
     /// is right on every route. Nothing else in the result differs.
     #[test]
@@ -1539,11 +1574,13 @@ mod tests {
                 .expose()
                 .to_string(),
         );
-        let unverified = unverified_import(&raw, "dummy cause".into()).ok().unwrap();
+        let unverified = unverified_import(&raw, undecided("dummy cause"))
+            .ok()
+            .unwrap();
         let shape = unverified.report("dummy-one");
         assert!(!shape.verified);
         assert_eq!(shape.accounts_visible, 0);
-        assert_eq!(unverified.unverified.as_deref(), Some("dummy cause"));
+        assert_eq!(unverified.unverified, Some(undecided("dummy cause")));
 
         let proven = prove_import(&raw, Source::Stdin, |_| Ok(accepted_page()))
             .ok()
@@ -1568,7 +1605,7 @@ mod tests {
                 ..CommonArgs::default()
             },
         ] {
-            let notes = result.notes(&common, Some("dummy cause."));
+            let notes = result.notes(&common, Some(&undecided("dummy cause.")));
             assert_eq!(notes.len(), 1, "{notes:?}");
             let note = &notes[0];
             assert!(note.starts_with("warning: "), "{note}");
@@ -1586,7 +1623,7 @@ mod tests {
                 "{note}"
             );
         }
-        let loud = result.notes(&CommonArgs::default(), Some("dummy cause"));
+        let loud = result.notes(&CommonArgs::default(), Some(&undecided("dummy cause")));
         assert!(loud[0].starts_with("warning: "), "{loud:?}");
         assert!(
             loud[1].contains("unverified, with no accounts read"),
@@ -2123,8 +2160,8 @@ mod tests {
         assert!(matches!(answer, Confirm::Ready), "{answer:?}");
         assert!(memory.refused.lock().unwrap().is_none());
         assert_eq!(
-            memory.unverified.lock().unwrap().as_deref(),
-            Some("dummy dropped connection")
+            *memory.unverified.lock().unwrap(),
+            Some(undecided("dummy dropped connection"))
         );
     }
 
@@ -2583,6 +2620,95 @@ mod tests {
             for dead in ["refused", "lapsed", "expired", "dead", "nothing was stored"] {
                 assert!(!warning.contains(dead), "{dead}: {warning}");
             }
+        }
+    }
+
+    /// Why the hook took the session on this answer.
+    fn undecided_after(status: u16, body: &str) -> Undecided {
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &memory, |_| {
+            crate::client::classify(status, URL, None, body)
+        });
+        assert!(
+            matches!(answer, Confirm::Ready),
+            "{status} {body}: {answer:?}"
+        );
+        let why = memory.unverified.lock().unwrap().take();
+        why.unwrap_or_else(|| panic!("{status} {body}: the read must not decide"))
+    }
+
+    /// A block on this client is not cleared by signing in, so an answer shaped like one
+    /// does not offer a new sign-in as the fix: it comes last, after waiting.
+    #[test]
+    fn an_edge_shaped_answer_puts_the_new_sign_in_last() {
+        for (status, body) in [
+            (200, PAGE),
+            (403, PAGE),
+            (404, PAGE),
+            (403, ""),
+            (403, "Forbidden"),
+        ] {
+            let why = undecided_after(status, body);
+            assert!(why.edge, "{status} {body}: {why:?}");
+            let warning = unverified_warning(&why, "dummy-one");
+            assert!(warning.contains("stored unverified"), "{warning}");
+            assert!(
+                warning.contains(
+                    "A new sign-in may not help, because a block like this is on the client \
+                     rather than the session"
+                ),
+                "{warning}"
+            );
+            let wait = warning.find("wait or try another network").unwrap();
+            let login = warning
+                .find(
+                    "only if reads still fail after that, run `rhd auth login --browser \
+                     --overwrite --profile dummy-one`",
+                )
+                .unwrap();
+            assert!(wait < login, "{warning}");
+            assert!(!warning.contains("reads keep failing"), "{warning}");
+        }
+    }
+
+    /// A throttle, an outage or a dropped connection can clear by the next read, and is
+    /// not a block a sign-in cannot clear, so it keeps its wording.
+    #[test]
+    fn a_throttle_an_outage_or_a_dropped_connection_keeps_its_wording() {
+        let mut undecideds = Vec::new();
+        for (status, body) in [
+            (429, PAGE),
+            (429, "{}"),
+            (500, "{}"),
+            (502, "bad gateway"),
+            (503, PAGE),
+            (404, "{}"),
+            (200, ""),
+            (200, "{nope"),
+            (200, "{}"),
+        ] {
+            undecideds.push(undecided_after(status, body));
+        }
+        undecideds.push(undecided("dummy dropped connection"));
+        for why in undecideds {
+            assert!(!why.edge, "{why:?}");
+            let warning = unverified_warning(&why, "dummy-one");
+            assert!(warning.contains("stored unverified"), "{warning}");
+            assert!(
+                warning.contains("`rhd accounts list --profile dummy-one`"),
+                "{warning}"
+            );
+            assert!(
+                warning.ends_with(
+                    "if reads keep failing, run `rhd auth login --browser --overwrite --profile \
+                     dummy-one`."
+                ),
+                "{warning}"
+            );
+            assert!(
+                !warning.contains(crate::client::SIGN_IN_MAY_NOT_HELP),
+                "{warning}"
+            );
         }
     }
 

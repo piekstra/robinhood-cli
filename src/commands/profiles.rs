@@ -93,7 +93,8 @@ pub fn add(
     store.save(&cfg)?;
     if !common.quiet {
         eprintln!(
-            "profile `{name}` saved — log in with `rhd auth login --browser --profile {name}`"
+            "profile `{name}` saved — log in with `rhd auth login --browser --profile {name}` \
+             (add `--overwrite` if it already holds a session)"
         );
     }
     Ok(())

@@ -180,7 +180,10 @@ enum AuthCmd {
     .long_help(BROWSER_HELP)
     .conflicts_with_all([
         "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
-    ])))]
+    ])),
+    // No login path reads it: the password login always reads first. It still parses,
+    // so a script that passes it keeps working.
+    mut_arg("no_verify", |a| a.hide(true)))]
 struct RhLoginArgs {
     #[command(flatten)]
     browser: BrowserArgs,
@@ -235,9 +238,10 @@ in the OS keychain, with no second read. It never prints the token.
 
 If that read cannot decide (a bot check, Robinhood throttled or down), rhd
 stores the session anyway, since the page held the only copy, and warns even
-under -q that it is unverified: if reads keep failing, run `rhd auth login
---browser --overwrite`. With a session already stored for this login, --browser
-stops before Chrome opens; pass --overwrite to replace it.
+under -q that it is unverified. If reads keep failing, run `rhd auth login
+--browser --overwrite`; after a bot check, wait or try another network first,
+since a new sign-in may not help. With a session already stored for this login,
+--browser stops before Chrome opens; pass --overwrite to replace it.
 
 The kept profile lets Robinhood remember this device, so a later sign-in
 often asks for less. It is a full Chrome profile, owner-only on disk:
@@ -874,6 +878,20 @@ fn cmd_to_config_op(cmd: &ConfigCmd) -> commands::misc::ConfigOp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--no-verify` is hidden, not gone: a script that passes it keeps working, and it
+    /// still conflicts with the routes that refuse it.
+    #[test]
+    fn the_hidden_no_verify_still_parses() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rhd", "auth", "login"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(parse(&["--no-verify"]).is_ok());
+        assert!(parse(&["--no-verify", "--browser"]).is_err());
+        assert!(parse(&["--no-verify", "--session-stdin"]).is_err());
+    }
 
     /// clap's own debug assertions catch conflicting shorts (e.g. a
     /// subcommand `-a` shadowing the global `--account`) only when the command

@@ -302,7 +302,7 @@ session is read over the Chrome DevTools Protocol:
 | Cookie | `device_id`, as the browser would send it to `https://robinhood.com/`, read from the browser's cookie jar (`Storage.getCookies`, which includes `HttpOnly` cookies). Optional: the capture never waits on it. When the expression's `device_token` is null, `rhd` fills it from this cookie before parsing |
 | Confirm | the hook takes the session only if it parses, is not past the point `rhd` would renew it (a minute before expiry) and one read of `/accounts/` does not refuse it. An accounts list takes it verified; an answer that cannot decide takes it unverified, with a warning; otherwise the tab stays open and the wait goes on (below) |
 | Then | every robinhood.com tab is closed the instant the session is confirmed, and Chrome is stopped. The value goes to the same parser and the same keychain item as `--session-stdin`, with no second read: the accounts page the hook accepted is its proof, or it is stored unverified (below). The two paths store identical credentials. `session-import/v1` reports `source: "browser"` |
-| Wait | up to 10 minutes; status lines on stderr (`-q` silences them); Ctrl-C cancels. A timeout or a window closed before sign-in is exit 3 naming `rhd auth login --browser --profile <NAME>`; no Chrome is exit 1 pointing at `--session-stdin`. Every failure once Chrome has run in the kept profile adds that the profile stays and what removes it, whichever step failed (`commands::auth::through_the_window`) |
+| Wait | up to 10 minutes; status lines on stderr (`-q` silences them); Ctrl-C cancels. A timeout or a window closed before sign-in is exit 3 naming `rhd auth login --browser --profile <NAME>`, with `--overwrite` or `--fresh-profile` if this run had it; no Chrome is exit 1 pointing at `--session-stdin`. Every failure once Chrome has run in the kept profile adds that the profile stays and what removes it, whichever step failed (`commands::auth::through_the_window`) |
 
 ```js
 (() => { const raw = localStorage['web:auth_state']; if (!raw) return null; let s; try { s = JSON.parse(raw); if (typeof s === 'string') s = JSON.parse(s); } catch { return null; } if (!s || !s.access_token) return null; const d = (document.cookie.match(/(?:^|; )device_id=([^;]+)/) || [])[1]; return JSON.stringify({ ...s, device_token: d || null }); })()
@@ -377,17 +377,26 @@ never renews from the window.
 dropped connection, an empty or unparseable body, a success that is not the accounts
 list, a 404, a 403 with no JSON, or an HTML page on any status but a 401 ends the wait at
 once with the session taken. `rhd` stores it, exits 0, and warns on stderr, under `-q`
-and `--json` too. The warning names the cause (a bot check names itself), says the
-session is unverified, and says that if reads keep failing, `rhd auth login --browser
---overwrite` is the way out. `session-import/v1` says `verified: false`. It always
+and `--json` too. The warning names the cause (a bot check names itself) and says the
+session is unverified. `session-import/v1` says `verified: false`. It always
 carries `verified`, a boolean: `true` when a read accepted the session, so `jq '.verified
 == true'` is right on every route. The page held the only local copy and site storage
 goes when Chrome stops, so discarding the session would cost a new sign-in. Site storage
 also went before Chrome started, so a token in the page can only be this sign-in's: a bad
-one costs one more sign-in, the same as discarding it, and a good one costs none. An
-outage can clear by the next read; an HTML 403 or an empty 2xx can repeat on every read,
-which is why the warning gives the way out. With no page there are no accounts to read,
-so the config records the login with no account adopted, and `accounts_visible` is 0.
+one costs one more sign-in, the same as discarding it, and a good one costs none. With no
+page there are no accounts to read, so the config records the login with no account
+adopted, and `accounts_visible` is 0.
+
+What the warning says next depends on the answer:
+
+| Answer | What it says |
+| --- | --- |
+| An HTML page on any status but a 401, or a 403 with no JSON (`ReadFailure::is_edge_shaped`) | A new sign-in may not help, because a block like this is on the client rather than the session: wait or try another network, and only if reads still fail after that, run `rhd auth login --browser --overwrite`. |
+| Anything else that cannot decide: a 429, a 5xx, a dropped connection, a 404, an empty or unparseable 2xx, a success that is not the accounts list | A later read may settle it; if reads keep failing, run `rhd auth login --browser --overwrite`. |
+
+Signing in does not clear a block on this client, and each attempt spends a sign-in and
+replaces the stored session, exiting 0 each time. So an ordinary read's error (§4.1, still
+exit 3), a renewal's and the MCP tools' fix say what the first row says.
 
 **A stored session is refused before Chrome opens.** With a session stored for this login
 and no `--overwrite`, `--browser` exits 2 before the window, so an unverified session
@@ -1241,8 +1250,11 @@ would encode a guess as a contract.
 
 `json_response` checks **shape before status**, because a lapsed session often
 comes back as an HTML login page with a `200`. HTML where JSON was expected is
-an auth failure (exit 3), not data, and the message names `rhd auth login --browser
---overwrite`. The exceptions are a 429 and a 5xx, read by status whatever the body: a
+an auth failure (exit 3), not data. An HTML 401 names `rhd auth login --browser
+--overwrite` at once. Any other HTML page, or a 403 with no JSON, says a new sign-in may
+not help, to wait or try another network, and only if reads still fail after that to run
+it (`client::edge_block_advice`). The exceptions are a 429 and a 5xx, read by status
+whatever the body: a
 throttle or an outage says nothing about the session. `--browser`'s confirm hook takes
 an HTML page as no verdict instead (§2.8).
 

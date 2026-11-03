@@ -625,6 +625,32 @@ fn a_provider_failure_is_upstream_not_the_arguments() {
     assert!(!text.contains("auth login"), "{text}");
 }
 
+/// A block at the edge is not cleared by signing in, so the fix does not lead with one.
+#[test]
+fn a_block_at_the_edge_does_not_ask_for_a_new_sign_in_first() {
+    let t = RobinhoodTools::new(Fixtures::new(), Ok("household".into()));
+    const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+    *t.source().fail.lock().unwrap() = Some(
+        crate::client::classify(403, "https://example.test/dummy", None, PAGE)
+            .unwrap_err()
+            .into_cli_error(),
+    );
+    let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
+    assert!(text.starts_with("auth:"), "{text}");
+    assert!(
+        text.contains("Wait or try another network, then call the tool again"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "ask the user to run `rhd auth login --browser --overwrite --profile household`"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("never sign in"), "{text}");
+    assert!(!text.contains("in a terminal, then call"), "{text}");
+}
+
 #[test]
 fn the_instructions_name_the_browser_login_and_the_scope() {
     let text = pk_cli_mcp::instructions(&tools());

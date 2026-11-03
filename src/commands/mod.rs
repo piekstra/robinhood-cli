@@ -281,14 +281,7 @@ impl Ctx {
         Ok(self
             .rh
             .refresh(refresh, tokens.refresh_device(profile_device.as_deref()))
-            .map_err(|e| match e {
-                CliError::Auth(msg) if tokens.origin.is_browser() => CliError::Auth(format!(
-                    "{msg} (this session came from a browser: sign in again with `rhd auth login \
-                     --browser --profile {}`)",
-                    self.profile
-                )),
-                other => other,
-            })?
+            .map_err(|e| renewal_error(e, tokens.origin.is_browser(), &self.profile))?
             .renewed(tokens))
     }
 
@@ -327,10 +320,56 @@ fn renew_session(
     })
 }
 
+/// A failed renewal as the owner reads it. A browser session's remedy is the browser
+/// sign-in, which replaces the session still stored. An answer shaped like a block at the
+/// edge already says what to do, with the sign-in last.
+fn renewal_error(e: CliError, browser: bool, profile: &str) -> CliError {
+    match e {
+        CliError::Auth(msg) if browser && !msg.contains(crate::client::SIGN_IN_MAY_NOT_HELP) => {
+            CliError::Auth(format!(
+                "{msg} (this session came from a browser: sign in again with `rhd auth login \
+                 --browser --overwrite --profile {profile}`)"
+            ))
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier, Mutex};
+
+    #[test]
+    fn a_browser_renewal_names_the_login_that_replaces_the_session() {
+        let err = renewal_error(CliError::Auth("dummy refusal".into()), true, "dummy-one");
+        assert_eq!(err.exit_code(), 3);
+        assert!(
+            err.to_string()
+                .contains("`rhd auth login --browser --overwrite --profile dummy-one`"),
+            "{err}"
+        );
+    }
+
+    /// Only a browser session's refusal gets the sign-in. A block at the edge has said
+    /// what to do already, and asking for a sign-in beside it would undo that.
+    #[test]
+    fn a_renewal_error_adds_the_sign_in_only_to_a_browser_refusal() {
+        let blocked = format!(
+            "dummy block. {}",
+            crate::client::edge_block_advice("dummy login")
+        );
+        let err = renewal_error(CliError::Auth(blocked.clone()), true, "dummy-one");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().ends_with(&blocked), "{err}");
+
+        let password = renewal_error(CliError::Auth("dummy refusal".into()), false, "dummy-one");
+        assert!(!password.to_string().contains("--overwrite"), "{password}");
+
+        let down = renewal_error(CliError::Upstream("dummy outage".into()), true, "dummy-one");
+        assert_eq!(down.exit_code(), 5);
+        assert!(!down.to_string().contains("--overwrite"), "{down}");
+    }
     use std::time::Duration;
 
     fn session(refresh: Option<&str>, expires_at: u64) -> Tokens {

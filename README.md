@@ -113,8 +113,10 @@ If Robinhood refuses the session, the window stays open for a new sign-in. If th
 cannot decide (a bot check, Robinhood throttled or down), `rhd` stores the session
 anyway, since the page held the only copy, exits 0, and warns even under `-q` that it is
 unverified; `--json` says `verified: false`. If reads then keep failing, run `rhd auth
-login --browser --overwrite`. With a session already stored for this login, `--browser`
-stops before Chrome opens unless you pass `--overwrite`.
+login --browser --overwrite`. After a bot check, wait or try another network first: a
+new sign-in may not help, because the block is on the client rather than the session.
+With a session already stored for this login, `--browser` stops before Chrome opens
+unless you pass `--overwrite`.
 
 The profile stays after a failed sign-in too, and every failure once the window has
 opened says so: a timeout, a closed window, Ctrl-C, a keychain write that fails. Those
@@ -326,7 +328,7 @@ terminal (see [Getting started](#getting-started)). Both ways of connecting
 Claude below then use that session from the OS keychain (service
 `piekstra.rhd`), and refresh it in place as the commands do. If the session
 is missing or has lapsed, the tools say so and ask you to run
-`rhd auth login --browser --profile <NAME>` in a terminal; they never sign in
+`rhd auth login --browser --overwrite --profile <NAME>` in a terminal; they never sign in
 by themselves. With several login profiles the server uses the default one
 (`rhd profiles use <NAME>`), or the one named by `rhd mcp --profile <NAME>`.
 

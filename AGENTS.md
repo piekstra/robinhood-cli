@@ -123,8 +123,9 @@ keychain write only, never across the sign-in: a login checks it first
 logout's or `profiles remove`'s delete runs with or without it
 (`auth::forget_session`).
 The tools never sign in: an auth error asks the user to run
-`rhd auth login --browser --profile <NAME>` in a terminal. A profile that
-cannot be chosen (several, no default) fails each call, not the server.
+`rhd auth login --browser --overwrite --profile <NAME>` in a terminal, or to wait first
+after a block at the edge. A profile that cannot be chosen (several, no default) fails
+each call, not the server.
 
 - Tests: `src/mcp/tests.rs` runs every tool in process over the fixtures
   through a fixture `Source` and cli-common's conformance helper;
@@ -234,6 +235,11 @@ and a rate-limited one.
   `session-import/v1` says `verified: false` (always a boolean), and the warning prints
   under `-q` and `--json` (`SessionImport::notes`). The page held the only copy, so it is
   stored.
+  `ReadFailure::is_edge_shaped` (an HTML page on any status but a 401, or a 403 with no
+  JSON) puts a new sign-in last in that warning, in an ordinary read's error, at a
+  renewal and in the MCP fix (`client::edge_block_advice`), because signing in does not
+  clear a block on this client. A 429, a 5xx or a dropped connection keeps "if reads
+  keep failing".
   `is_auth` stays as it is for ordinary reads, exit 3, and `--session-stdin` stores
   nothing unless its read proves it. `chrome_is_missing` keeps the surface tests, which
   stop at a missing `RHD_CHROME`, off the keychain.

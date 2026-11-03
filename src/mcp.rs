@@ -191,11 +191,19 @@ impl<S: Source> RobinhoodTools<S> {
     /// A provider failure as a tool error; a sign-in failure names the
     /// browser login for this profile.
     fn err(&self, e: CliError) -> ToolError {
+        let profile = self.profile.as_deref().unwrap_or("<NAME>");
+        let login = format!("rhd auth login --browser --overwrite --profile {profile}");
         match e {
+            CliError::Auth(m) if m.contains(crate::client::SIGN_IN_MAY_NOT_HELP) => {
+                ToolError::auth(m).with_fix(format!(
+                    "Wait or try another network, then call the tool again. Only if it still \
+                     fails after that, ask the user to run `{login}` in a terminal. Tools never \
+                     sign in or create credentials themselves"
+                ))
+            }
             CliError::Auth(m) => ToolError::auth(m).with_fix(format!(
-                "Ask the user to run `rhd auth login --browser --overwrite --profile {}` in a terminal, \
-                 then call the tool again. Tools never sign in or create credentials themselves",
-                self.profile.as_deref().unwrap_or("<NAME>")
+                "Ask the user to run `{login}` in a terminal, then call the tool again. Tools \
+                 never sign in or create credentials themselves"
             )),
             other => other.into(),
         }
@@ -399,7 +407,8 @@ impl<S: Source> Toolset for RobinhoodTools<S> {
         Server::new("rhd", env!("CARGO_PKG_VERSION"), "Robinhood", "robinhood").instructions(
             "Robinhood access here is read-only: no tool can trade, transfer or change \
              anything. Robinhood sign-in is through a browser: the command to ask for is `rhd \
-             auth login --browser`. Values cover cash and stocks/ETFs; options and crypto are \
+             auth login --browser`, with `--overwrite` if a session is already stored. Values \
+             cover cash and stocks/ETFs; options and crypto are \
              not included. Amounts are USD decimal strings; keep every digit when adding them.",
         )
     }

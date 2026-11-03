@@ -54,6 +54,16 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
   `verified`, a boolean, `true` when a read accepted the session), and a warning says why,
   even under `-q`, that it is unverified, and that if reads keep failing, `rhd auth login
   --browser --overwrite` is the way out.
+- After a bot check's page or a 403 with no JSON, that warning says a new sign-in may not
+  help, because the block is on the client rather than the session: wait or try another
+  network, and only if reads still fail after that, run `rhd auth login --browser
+  --overwrite`. An ordinary read's error says the same, still exit 3, unless the answer
+  is a definite refusal, and so do a renewal's error and the MCP tools' fix.
+- A failed renewal of a browser session names `--overwrite`, because the session is still
+  stored and `--browser` refuses without the flag.
+- `rhd auth login --help` no longer offers `--no-verify`, which no login path reads: the
+  password login always reads before it stores. It still parses, so a script that passes
+  it keeps working.
 - `rhd auth login --browser` now refuses before Chrome opens, exit 2, when this login
   already has a stored session and `--overwrite` was not passed. It used to replace the
   stored session with no flag. Messages that send you back to sign in with a session

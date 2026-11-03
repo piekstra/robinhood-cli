@@ -193,6 +193,16 @@ const NO_CHROME: &str = "/nonexistent/rhd-test-chrome";
 
 /// `--browser` is the way in, so it leads the help, and its long help says
 /// what opens, what is read from where, and how to point at another Chrome.
+/// No login path reads `--no-verify`, so `--help` does not offer it. It still parses:
+/// `the_hidden_no_verify_still_parses`. `--overwrite` has an effect, so it stays.
+#[test]
+fn login_help_hides_the_flag_with_no_effect() {
+    let out = rhd().args(["auth", "login", "--help"]).assert().success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(!text.contains("--no-verify"), "{text}");
+    assert!(text.contains("--overwrite"), "{text}");
+}
+
 #[test]
 fn auth_login_help_leads_with_browser() {
     let out = rhd().args(["auth", "login", "--help"]).assert().success();
