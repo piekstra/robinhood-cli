@@ -358,8 +358,7 @@ failure refuses the launch (exit 1, no Chrome), and again once Chrome has stoppe
 crash or a second Ctrl-C skips the second removal, as does a Chrome still running in
 the profile; the tokens then stay on disk, `0700` their only protection, until the
 next launch or logout. Each window therefore opens with no session in the page. The
-expression only reads: the evaluation can run more than once, so a removal could lose
-a session the capture never took.
+expression only reads.
 
 **The confirm hook judges what it read.** The tab stays open on a session that does
 not parse, is past the point `rhd` would renew it, or that Robinhood refuses, until a

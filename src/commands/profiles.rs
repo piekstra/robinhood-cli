@@ -331,6 +331,47 @@ mod tests {
         assert_eq!(cfg.default_profile.as_deref(), Some("dummy-two"));
     }
 
+    /// A refresh lock held past the wait: the session is deleted and a renewal may
+    /// store it again. Exit 5, every other step still runs, the report does not say
+    /// the session remains, and the config entry stays, because the retry needs it.
+    #[test]
+    fn a_held_refresh_lock_keeps_the_login_for_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let cfg = config_with(&["dummy-one", "dummy-two"], "dummy-one");
+        store.save(&cfg).unwrap();
+        let session = config::token_key("dummy-one");
+        let mut tried = 0;
+        let err = drop_profile(
+            &store,
+            cfg,
+            "dummy-one",
+            |key| {
+                tried += 1;
+                if key == session {
+                    Err(CliError::Upstream("dummy: lock held".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(true),
+        )
+        .unwrap_err();
+        assert_eq!(tried, 4);
+        assert_eq!(err.exit_code(), 5, "{err}");
+        let message = err.to_string();
+        for needle in [
+            "the session, the stored password, the device token and the browser profile are \
+             cleared",
+            "a renewal that can store the session again and this login's config entry remain",
+            "As that says, run `rhd profiles remove dummy-one --force`",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        let cfg: Config = store.load().unwrap();
+        assert!(cfg.profiles.contains_key("dummy-one"));
+    }
+
     /// A keychain step that fails stops nothing: every other item is still
     /// tried and the browser profile still removed, and the exit code is that
     /// failure's. The config entry stays for the retry.

@@ -215,9 +215,8 @@ and a rate-limited one.
   and refresh tokens rotate on every use. Keep it on.
   `commands::auth::confirm_candidate` lets the tab close only on a session short of
   `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood accepts.
-  `capture::SESSION_EXPRESSION` and the Console snippet only read. Do not add a
-  removal to the expression: the evaluation can run more than once, and clearing site
-  storage belongs to cli-common.
+  `capture::SESSION_EXPRESSION` and the Console snippet only read: clearing site
+  storage belongs to `clear_site_storage`.
 - **It is a full Chrome profile** (cookies, history with full URLs, HTTP cache),
   `0700` its only protection beyond Chrome's cookie encryption, which on
   Linux with no desktop keyring uses a fixed, publicly known key. It outlives a

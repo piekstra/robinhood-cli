@@ -58,11 +58,9 @@ const DEVICE_COOKIE_URL: &str = "https://robinhood.com/";
 /// `device_token`, or `device_token: null` when `document.cookie` cannot see
 /// it: what the Console snippet in `--session-stdin`'s help copies.
 ///
-/// It only reads. The launch clears the profile's site storage
-/// (`commands::auth::browser_launch`), and the evaluation runs at least once, so a
-/// removal from here could lose a session the capture never took.
-/// Whether what it reads is worth taking is the confirm hook's call
-/// (`commands::auth::confirm_candidate`).
+/// It only reads: the launch clears the profile's site storage
+/// (`commands::auth::browser_launch`). Whether what it reads is worth taking is the
+/// confirm hook's call (`commands::auth::confirm_candidate`).
 pub const SESSION_EXPRESSION: &str = "(() => { \
     const raw = localStorage['web:auth_state']; \
     if (!raw) return null; \
@@ -689,8 +687,7 @@ pub(crate) mod tests {
         assert!(SESSION_EXPRESSION.contains("device_token: d || null"));
     }
 
-    /// It only reads: the evaluation can run more than once, so a removal could
-    /// lose a session the capture never took.
+    /// It only reads: the launch clears the profile's site storage.
     #[test]
     fn the_expression_only_reads() {
         for write in ["removeItem", "setItem", ".clear("] {
