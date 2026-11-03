@@ -64,9 +64,10 @@ $ rhd accounts list --profile primary
 
 ## Signing in
 
-`rhd auth login --browser` opens Chrome at <https://robinhood.com/login> with
-a throwaway profile. Sign in there: your password and any code or approval
-Robinhood asks for go into Robinhood's own page, never into `rhd`.
+`rhd auth login --browser` opens Chrome at <https://robinhood.com/login>, in a
+profile `rhd` keeps for that login, separate from every other login's. Sign in
+there: your password and any code or approval Robinhood asks for go into
+Robinhood's own page, never into `rhd`.
 
 ```console
 $ rhd auth login --browser --profile primary
@@ -76,15 +77,66 @@ stored the browser sign-in's session (web:auth_state) into profile `primary` —
 renews unattended: the refresh token is stored; the access token is good until …
 ```
 
-As soon as the robinhood.com page holds a session, `rhd` reads it (the web
-app's `web:auth_state` and its `device_id` cookie, from robinhood.com only),
-closes the tab, quits Chrome and deletes the profile. It then reads your
-accounts once with the session and stores it in the OS keychain only if that
-read succeeds; it never prints the token. Closing the tab at once matters:
-the web app and `rhd` would otherwise share one refresh token that rotates on
-every renewal, and a later Log out in that window would revoke it. The
-session lands where a password login's would, so every command works
-unchanged and `auth status` reports `browser-session`.
+As soon as the robinhood.com page holds a session Robinhood does not refuse, which one
+read of your accounts decides, `rhd` takes it (the web app's `web:auth_state` and its
+`device_id` cookie, from robinhood.com only), closes the tab, quits Chrome and stores
+the session in the OS keychain, with no second read; it never prints the token.
+Closing the tab at once matters: the web app and `rhd` would
+otherwise share one refresh token that rotates on every renewal, and a later Log
+out in that window would revoke it. The session lands where a password login's
+would, so every command works unchanged and `auth status` reports
+`browser-session`.
+
+The kept profile lets Robinhood remember this device (its `device_id` cookie), so
+a later sign-in often asks for less. Each login keeps its own, so one account's
+sign-in never opens signed in as another:
+`~/Library/Application Support/piekstra.rhd/browser-profile-<NAME>` on macOS and
+under `$XDG_DATA_HOME` (or `~/.local/share`) on Linux, owner-only (`0700`); other
+systems use a scratch profile every time. `rhd auth login --browser
+--fresh-profile` signs in once through a scratch profile, deleted afterwards, and
+leaves the kept one alone.
+
+The trade is more than cookies. It is a full Chrome profile, so it also keeps
+browsing history with full URLs, query strings included, and the HTTP cache, for
+whatever you open in that window. Chrome's cookie encryption does not cover those:
+the directory's `0700` mode is their only protection, and ordinary backups usually
+include the directory ([`SECURITY.md`](SECURITY.md)). On Linux with no desktop
+keyring Chrome encrypts the cookies with a fixed, publicly known key, so there the
+session cookie has only `0700` too.
+
+It does not keep the session's tokens. Robinhood's page holds them in site storage,
+which `rhd` removes before Chrome starts and again once Chrome has stopped. A crash
+or a second Ctrl-C skips the second removal; the next launch or `rhd auth logout`
+covers it.
+
+If Robinhood refuses the session, the window stays open for a new sign-in. If the read
+cannot decide (a bot check, Robinhood throttled or down), `rhd` stores the session
+anyway, since the page held the only copy, exits 0, and warns even under `-q` that it is
+unverified; `--json` says `verified: false`. If reads then keep failing, run `rhd auth
+login --browser --overwrite`. After a bot check, wait or try another network first: a
+new sign-in may not help, because the block is on the client rather than the session.
+With a session already stored for this login, `--browser` stops before Chrome opens
+unless you pass `--overwrite`.
+
+The profile stays after a failed sign-in too, and every failure once the window has
+opened says so: a timeout, a closed window, Ctrl-C, a keychain write that fails. Those
+can leave a live session in
+it. `rhd auth status` says whether that login keeps a profile (`browser_profile`
+with `--json`), not whether anything is signed in there. `rhd auth logout` and `rhd profiles remove` remove it, for
+that login only, and clear its stored session with it. They attempt every step even
+after one fails, then say what is cleared and what remains, and exit with the first
+failure's code. While a sign-in or a Chrome window is using the profile, they clear
+the session, exit 1 and say what remains; close the window and run the command again.
+`rhd auth logout --profile <NAME>` runs every step but the config entry even when the
+config file cannot be parsed or does not know that name, so what a failed first sign-in
+left can be removed. With a file it cannot parse and no `--profile` or `RHD_PROFILE`,
+it asks which login, since the name is in that file.
+
+A login whose name a Chrome profile cannot carry (anything but 1 to 64 ASCII
+letters, digits, `-` or `_`, which `rhd profiles add` already refuses) cannot keep
+a profile. `--browser` refuses it, exit 2, before Chrome starts, and never maps it
+onto another login's profile; `--browser --fresh-profile` still signs it in, and
+reads and logout work as before.
 
 Chrome, Chromium or Edge is found at the standard install paths; set
 `RHD_CHROME` to use another binary. `rhd auth login --help` has the details,
@@ -276,7 +328,7 @@ terminal (see [Getting started](#getting-started)). Both ways of connecting
 Claude below then use that session from the OS keychain (service
 `piekstra.rhd`), and refresh it in place as the commands do. If the session
 is missing or has lapsed, the tools say so and ask you to run
-`rhd auth login --browser --profile <NAME>` in a terminal; they never sign in
+`rhd auth login --browser --overwrite --profile <NAME>` in a terminal; they never sign in
 by themselves. With several login profiles the server uses the default one
 (`rhd profiles use <NAME>`), or the one named by `rhd mcp --profile <NAME>`.
 
@@ -341,11 +393,14 @@ renews without the lock the others use, which can cost a sign-in.
 
 Passwords, OAuth tokens (including a session from a browser), and device
 tokens live only in the OS keychain (`piekstra.rhd`), namespaced per profile.
-Nothing sensitive is ever accepted on argv or written to disk. With `rhd mcp
---http`, its bearer token also lives in your Cloudflare Worker. A browser
-session arrives from the sign-in window over Chrome's DevTools protocol
-(`--browser`, whose throwaway profile is deleted afterwards) or on stdin
-(`--session-stdin`). See [`SECURITY.md`](SECURITY.md).
+Nothing sensitive is ever accepted on argv, and `rhd` writes none to disk itself.
+With `rhd mcp --http`, its bearer token also lives in your Cloudflare Worker. A
+browser session arrives from the sign-in window over Chrome's DevTools protocol
+(`--browser`) or on stdin (`--session-stdin`). The one thing on disk is Chrome's own:
+the profile `--browser` keeps, a full Chrome profile with its cookies, history and
+cache, until `rhd auth logout` removes it. The session's tokens are in it only while
+a window is open, and after a crash until the next launch. See
+[`SECURITY.md`](SECURITY.md).
 
 ```console
 $ op read 'op://Private/robinhood/password' \

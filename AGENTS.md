@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.18.0"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.20.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -63,7 +63,9 @@ Tests are **fully offline**: no network, no keychain, no credentials, and no
 Chrome. Keep them that way (see "Costing the credential loop" below). The
 `--browser` tests stop at clap's flag conflicts or at an `RHD_CHROME` that
 does not exist; the capture itself is checked with `Capture::validate` and a
-scrubbed fixture of the expression's answer.
+scrubbed fixture of the expression's answer, the confirm hook on captures built
+by hand, and profile selection and the in-use lock with a shell-script stand-in
+for Chrome under a temp root (`Launch::profile_root`).
 
 ## Layout
 
@@ -121,8 +123,10 @@ keychain write only, never across the sign-in: a login checks it first
 logout's or `profiles remove`'s delete runs with or without it
 (`auth::forget_session`).
 The tools never sign in: an auth error asks the user to run
-`rhd auth login --browser --profile <NAME>` in a terminal. A profile that
-cannot be chosen (several, no default) fails each call, not the server.
+`rhd auth login --browser --overwrite --profile <NAME>` in a terminal, to wait first
+after a block at the edge, or, after an HTML 200, to sign in only if the session was
+logged out or revoked elsewhere. A profile that cannot be chosen (several, no default) fails
+each call, not the server.
 
 - Tests: `src/mcp/tests.rs` runs every tool in process over the fixtures
   through a fixture `Source` and cli-common's conformance helper;
@@ -165,7 +169,8 @@ These are the ones that cost real debugging time elsewhere in the family:
 
 - **Never report success from a status code alone.** A `200` carrying an HTML
   login page is an auth failure. Treat "HTML where JSON was expected" and
-  "landed on a login URL" as `CliError::Auth`, not success.
+  "landed on a login URL" as `CliError::Auth`, not success. A 429 or a 5xx is not
+  that, whatever its body: it says nothing about the session.
 - **A download is not a document until it matches its declared `filetype`.**
   `%PDF` magic for a PDF; for text filetypes (`csv`, `html` exist live), none
   of the known failure shapes — a DRF JSON error, an S3 XML error, HTML where
@@ -200,11 +205,62 @@ and a rate-limited one.
 - **Sign in through the browser** (`auth login --browser`, docs/api.md §2.8)
   rather than retrying the password login. Live on 2026-10-27 the password
   login re-challenged on every attempt and no prompt reached the phone.
-  `--browser` opens Chrome at robinhood.com/login with a throwaway profile,
-  the owner signs in on Robinhood's page, and `rhd` reads the stored session,
+  `--browser` opens Chrome at robinhood.com/login in a profile kept per login,
+  the owner signs in on Robinhood's page, and `rhd` takes the stored session,
   closes the tab at once (so the web app cannot rotate the refresh token it
-  shares with `rhd`, or log it out), and spends one ordinary read proving it.
+  shares with `rhd`, or log it out), and one ordinary read checks it. A session is
+  stored only with `--overwrite` if one is already there: `refuse_overwrite` stops it
+  before Chrome opens.
   It needs the owner at the window: never run it unattended or from a test.
+- **The kept browser profile.** `Launch::profile_name(<login>)` keeps one per
+  login profile, so one household account's sign-in never opens signed in as
+  another, and `--fresh-profile` opts out for one run. `commands::auth::browser_launch`
+  turns on `clear_site_storage`: the page keeps the session's tokens in `localStorage`,
+  and refresh tokens rotate on every use. Keep it on.
+  `commands::auth::confirm_candidate` lets the tab close only on a session short of
+  `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood does not refuse.
+  `capture::SESSION_EXPRESSION` and the Console snippet only read: clearing site
+  storage belongs to `clear_site_storage`.
+- **It is a full Chrome profile** (cookies, history with full URLs, HTTP cache),
+  `0700` its only protection beyond Chrome's cookie encryption, which on
+  Linux with no desktop keyring uses a fixed, publicly known key. It outlives a
+  failed sign-in, so every failure from the window on says so: they all pass through
+  `through_the_window` into `failed_sign_in`, so add a new step there. `auth status`
+  reports the active login's as `browser_profile` through `browser_profile_status`,
+  whose tests fill the seam with `named_profile_exists_in`. It says a profile is kept,
+  not that anything is signed in there.
+- **A read that cannot decide keeps the sign-in.** In `confirm_candidate` only
+  `ReadFailure::definite_refusal` is a refusal (`NotYet`): a 401, or Robinhood's JSON on
+  a 403. An accounts list is `Ready` with the page kept. Anything else is `Ready` with
+  its cause in `WindowMemory::unverified`: `finish_window` stores the session,
+  `session-import/v1` says `verified: false` (always a boolean), and the warning prints
+  under `-q` and `--json` (`SessionImport::notes`). The page held the only copy, so it is
+  stored.
+  `ReadFailure::is_edge_shaped` (an HTML page on any status but a 401, or a 403 with no
+  JSON) puts a new sign-in last in that warning (`client::edge_block_advice`), because
+  signing in does not clear a block on this client. So do a renewal's error, and an
+  ordinary read's error and the MCP fix for an HTML or bare 403. HTML on another status,
+  such as a 200, is also what a session logged out elsewhere answers, so an ordinary read
+  and the MCP fix name both remedies (`client::logged_out_or_blocked_advice`, docs/api.md
+  §4.1). A 429, a 5xx or a dropped connection keeps "if reads keep failing", and a 5xx
+  from the token endpoint is exit 5 with no sign-in (`client::token_answer`).
+  `is_auth` stays as it is for ordinary reads, exit 3, and `--session-stdin` stores
+  nothing unless its read proves it. `chrome_is_missing` keeps the surface tests, which
+  stop at a missing `RHD_CHROME`, off the keychain.
+- **`auth logout` and `profiles remove` remove the login's kept profile, and no
+  test may reach the real one.** The removal goes through the `logout_browser` seam:
+  the binary binds `forget_named_profile(BIN, name)`, tests bind
+  `forget_named_profile_in` under a temp dir (`pk-cli-browser`'s `test-util`, a
+  dev-dependency only). Every step is attempted even after one fails, so a keychain
+  failure does not leave the profile behind, and the error says what is cleared and
+  what remains, built from the inner messages, with the first failure's exit code
+  (`TeardownSteps`). The config entry is the one exception: it goes last, only once
+  the rest is clear, because `profiles remove` and a logout that names no login find
+  it there. `auth logout` loads the config itself (`auth_logout`, `logout_target`): a
+  name from `--profile` or `RHD_PROFILE` runs every step whether the config cannot be
+  parsed or does not know it, since a failed first sign-in leaves a profile under such
+  a name, and without a name it refuses rather than guess. Reads stay strict
+  (`Config::require_profile`).
   `--session-stdin` is the fallback (a session copied out of DevTools), and
   goes through the same parser, proof and keychain item. Either bundle
   carries its own `origin` and the browser's `device_token`, and renews with

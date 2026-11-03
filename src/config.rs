@@ -57,6 +57,18 @@ pub const PROFILE_ENV: &str = "RHD_PROFILE";
 /// Env var naming the active brokerage account number.
 pub const ACCOUNT_ENV: &str = "RHD_ACCOUNT";
 
+/// Whether `name` can be a login profile: 1 to 64 ASCII letters, digits, `-` or
+/// `_`. It becomes part of a keychain entry name and names the Chrome profile
+/// a browser sign-in keeps for it, whose rule this is
+/// (`pk_cli_browser::Launch::profile_name`, which checks a name and never
+/// rewrites it).
+pub fn profile_name_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Keychain account for a profile's password.
 pub fn password_key(profile: &str) -> String {
     format!("{profile}/password")
@@ -92,6 +104,15 @@ pub fn pending_key(profile: &str) -> String {
     format!("{profile}/pending")
 }
 
+/// The login named by `--profile` or `$RHD_PROFILE`, if either does: what is known
+/// without the config.
+pub fn named_profile(flag: Option<&str>) -> Option<String> {
+    if let Some(p) = flag {
+        return Some(p.to_string());
+    }
+    std::env::var(PROFILE_ENV).ok().filter(|p| !p.is_empty())
+}
+
 /// On-disk, non-secret settings.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -125,13 +146,8 @@ impl Config {
     /// type `--profile`, but the moment a second is added the name becomes
     /// load-bearing and [`Config::require_profile`] starts insisting on it.
     pub fn resolve_profile(&self, flag: Option<&str>) -> String {
-        if let Some(p) = flag {
-            return p.to_string();
-        }
-        if let Ok(p) = std::env::var(PROFILE_ENV) {
-            if !p.is_empty() {
-                return p;
-            }
+        if let Some(p) = named_profile(flag) {
+            return p;
         }
         if let Some(p) = &self.default_profile {
             return p.clone();

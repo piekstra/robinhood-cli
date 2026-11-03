@@ -255,13 +255,13 @@ impl Ctx {
         CliError::Auth(match tokens.origin {
             Origin::Bearer => format!(
                 "the browser session imported into `{p}` has expired — a bare bearer token \
-                 cannot be renewed; sign in again with `rhd auth login --browser --profile \
-                 {p}`, which stores the renewable web:auth_state shape",
+                 cannot be renewed; sign in again with `rhd auth login --browser --overwrite \
+                 --profile {p}`, which stores the renewable web:auth_state shape",
                 p = self.profile
             ),
             _ => format!(
                 "the cached session for `{p}` expired and carries no refresh token — run \
-                 `rhd auth login --browser --profile {p}`",
+                 `rhd auth login --browser --overwrite --profile {p}`",
                 p = self.profile
             ),
         })
@@ -281,14 +281,7 @@ impl Ctx {
         Ok(self
             .rh
             .refresh(refresh, tokens.refresh_device(profile_device.as_deref()))
-            .map_err(|e| match e {
-                CliError::Auth(msg) if tokens.origin.is_browser() => CliError::Auth(format!(
-                    "{msg} (this session came from a browser: sign in again with `rhd auth login \
-                     --browser --profile {}`)",
-                    self.profile
-                )),
-                other => other,
-            })?
+            .map_err(|e| renewal_error(e, tokens.origin.is_browser(), &self.profile))?
             .renewed(tokens))
     }
 
@@ -327,10 +320,59 @@ fn renew_session(
     })
 }
 
+/// A failed renewal as the owner reads it. A browser session's remedy is the browser
+/// sign-in, which replaces the session still stored. An answer shaped like a block at the
+/// edge already says what to do, with the sign-in last.
+fn renewal_error(e: CliError, browser: bool, profile: &str) -> CliError {
+    match e {
+        CliError::Auth(msg) if browser && !msg.contains(crate::client::SIGN_IN_MAY_NOT_HELP) => {
+            CliError::Auth(format!(
+                "{msg} (this session came from a browser: sign in again with `rhd auth login \
+                 --browser --overwrite --profile {profile}`)"
+            ))
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier, Mutex};
+
+    #[test]
+    fn a_browser_renewal_names_the_login_that_replaces_the_session() {
+        let err = renewal_error(CliError::Auth("dummy refusal".into()), true, "dummy-one");
+        assert_eq!(err.exit_code(), 3);
+        assert!(
+            err.to_string()
+                .contains("`rhd auth login --browser --overwrite --profile dummy-one`"),
+            "{err}"
+        );
+    }
+
+    /// Only a browser session's refusal gets the sign-in. A block at the edge has said
+    /// what to do already, and asking for a sign-in beside it would undo that.
+    #[test]
+    fn a_renewal_error_adds_the_sign_in_only_to_a_browser_refusal() {
+        let blocked = format!(
+            "dummy block. {}",
+            crate::client::edge_block_advice("dummy login")
+        );
+        let err = renewal_error(CliError::Auth(blocked.clone()), true, "dummy-one");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().ends_with(&blocked), "{err}");
+
+        let not_browser = renewal_error(CliError::Auth("dummy refusal".into()), false, "dummy-one");
+        assert!(
+            !not_browser.to_string().contains("--overwrite"),
+            "{not_browser}"
+        );
+
+        let down = renewal_error(CliError::Upstream("dummy outage".into()), true, "dummy-one");
+        assert_eq!(down.exit_code(), 5);
+        assert!(!down.to_string().contains("--overwrite"), "{down}");
+    }
     use std::time::Duration;
 
     fn session(refresh: Option<&str>, expires_at: u64) -> Tokens {
@@ -398,6 +440,46 @@ mod tests {
             assert_eq!(session.refresh_token.as_deref(), Some("dummy-refresh-2"));
         }
         assert_eq!(*grants.lock().unwrap(), ["dummy-refresh-1"]);
+    }
+
+    /// An outage at the token endpoint says nothing about the session, and its refresh
+    /// token may still work: it stays as it was, whatever the body, and the error is
+    /// exit 5 with no sign-in, a browser session's included.
+    #[test]
+    fn a_renewal_5xx_neither_replaces_nor_removes_the_session() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Service Unavailable</title></html>";
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            PAGE,
+            "",
+            "Service Unavailable",
+            r#"{"detail":"dummy outage"}"#,
+        ] {
+            let stored = Mutex::new(Some(expired("dummy-refresh-1")));
+            let err = renew_session(
+                &RefreshLock::at(dir.path().join("token-refresh.lock")),
+                || Ok(stored.lock().unwrap().clone().unwrap()),
+                not_renewable,
+                |_, _| {
+                    let answer = crate::client::renewal_answer(503, body).unwrap_err();
+                    Err(renewal_error(answer, true, "dummy-one"))
+                },
+                |fresh| {
+                    *stored.lock().unwrap() = Some(fresh.clone());
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 5, "{body}: {err}");
+            assert!(!err.to_string().contains("auth login"), "{body}: {err}");
+            let after = stored
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the session is still stored");
+            assert_eq!(after.refresh_token.as_deref(), Some("dummy-refresh-1"));
+            assert_eq!(after.access_token, expired("dummy-refresh-1").access_token);
+        }
     }
 
     #[test]

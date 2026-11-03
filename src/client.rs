@@ -217,7 +217,8 @@ impl Tokens {
     pub fn from_json(raw: &str) -> Result<Self, CliError> {
         serde_json::from_str(raw).map_err(|e| {
             CliError::Auth(format!(
-                "the cached session could not be read ({e}) — run `rhd auth login --browser` again"
+                "the cached session could not be read ({e}) — run `rhd auth login --browser \
+                 --overwrite` again"
             ))
         })
     }
@@ -230,8 +231,15 @@ impl Tokens {
     /// A session with no known expiry is reported usable — the server stays
     /// the authority, and guessing "expired" would force a needless login.
     pub fn is_expired(&self) -> bool {
+        self.is_expired_at(now_unix())
+    }
+
+    /// [`Tokens::is_expired`] at `now`: the rule a renewal goes by, so a caller
+    /// checking whether a token may already have been renewed asks the same
+    /// question.
+    pub fn is_expired_at(&self, now: u64) -> bool {
         match self.expires_at {
-            Some(exp) => exp.saturating_sub(60) <= now_unix(),
+            Some(exp) => exp.saturating_sub(60) <= now,
             None => false,
         }
     }
@@ -602,11 +610,11 @@ impl Rh {
         if let Some(d) = device_token {
             form.push(("device_token", d.to_string()));
         }
-        let v = self.post_token(&form, None)?;
+        let v = self.post_token_with(&form, None, html_at_renewal)?;
         if v.get("verification_workflow").is_some() {
             return Err(CliError::Auth(
                 "the stored session can no longer be refreshed (Robinhood wants device \
-                 approval again) — run `rhd auth login --browser`"
+                 approval again) — run `rhd auth login --browser --overwrite`"
                     .into(),
             ));
         }
@@ -641,6 +649,16 @@ impl Rh {
         form: &[(&str, String)],
         challenge_id: Option<&str>,
     ) -> Result<Value, CliError> {
+        self.post_token_with(form, challenge_id, html_at_login)
+    }
+
+    /// [`post_token`](Self::post_token), with what an HTML answer means to the caller.
+    fn post_token_with(
+        &self,
+        form: &[(&str, String)],
+        challenge_id: Option<&str>,
+        on_html: fn(u16) -> CliError,
+    ) -> Result<Value, CliError> {
         self.pace();
         let mut req = self
             .http
@@ -658,21 +676,7 @@ impl Rh {
         let text = resp
             .text()
             .map_err(|e| CliError::Upstream(format!("reading login response: {e}")))?;
-
-        if status == 429 {
-            return Err(throttled(retry_after.as_deref()));
-        }
-        let v = parse_json(&text, status)?;
-        // A 4xx that still carries a challenge/workflow is the flow working as
-        // designed, so those are handed back rather than raised as errors.
-        if (200..300).contains(&status)
-            || v.get("challenge").is_some()
-            || v.get("verification_workflow").is_some()
-            || v.get("mfa_required").is_some()
-        {
-            return Ok(v);
-        }
-        Err(login_error(&v, status))
+        token_answer(status, retry_after.as_deref(), &text, on_html)
     }
 
     /// Answer an SMS/email challenge. Positive confirmation only.
@@ -904,7 +908,8 @@ impl Rh {
         }
         if status == 401 || status == 403 {
             return Err(CliError::Auth(format!(
-                "Robinhood refused the document download (HTTP {status}) — run `rhd auth login --browser`"
+                "Robinhood refused the document download (HTTP {status}) — run `rhd auth login \
+                 --browser --overwrite`"
             )));
         }
         if status == 404 {
@@ -984,8 +989,13 @@ pub fn same_origin_of(base: &str, url: &str) -> bool {
 #[derive(Debug)]
 pub enum ReadFailure {
     /// 401/403: the provider refused the token. `detail` is the provider's
-    /// own message, when it gave one.
-    Rejected { status: u16, detail: Option<String> },
+    /// own message, when it gave one. `json_body` says whether the body was JSON:
+    /// a bare 403 can come from an edge in front of the provider.
+    Rejected {
+        status: u16,
+        detail: Option<String>,
+        json_body: bool,
+    },
     /// HTML where JSON was expected — how a bounced session usually answers,
     /// often with a 200.
     Html { status: u16, url: String },
@@ -1007,10 +1017,55 @@ impl ReadFailure {
         )
     }
 
+    /// What the answer says, if it refuses the token for certain: a 401, or
+    /// Robinhood's own JSON on a 403. An HTML page or a bare 403 can come from an edge
+    /// in front of Robinhood, so it says nothing certain about the token, though an
+    /// ordinary read treats it as [`is_auth`](Self::is_auth).
+    pub fn definite_refusal(&self) -> Option<String> {
+        match self {
+            ReadFailure::Rejected {
+                status, json_body, ..
+            } if *status == 401 || *json_body => Some(self.cause()),
+            ReadFailure::Html { status: 401, .. } => {
+                Some("Robinhood rejected the request (HTTP 401)".into())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the answer is shaped like a block at the edge: an HTML page or a 403 with
+    /// no JSON, and no definite refusal. A throttle or an outage is read by its status
+    /// first, whatever its body, so it is never this. It holds for a session written
+    /// moments ago; for an older one, [`into_cli_error`](Self::into_cli_error) reads an
+    /// HTML page by its status too.
+    pub fn is_edge_shaped(&self) -> bool {
+        matches!(
+            self,
+            ReadFailure::Html { .. } | ReadFailure::Rejected { .. }
+        ) && self.definite_refusal().is_none()
+    }
+
+    /// What an answer that is no [`definite_refusal`](Self::definite_refusal) said,
+    /// for a session stored unverified. Unlike [`cause`](Self::cause), it does not
+    /// suggest the session has lapsed: this one was written moments ago.
+    pub fn inconclusive_cause(&self) -> String {
+        match self {
+            ReadFailure::Html { status, url } => format!(
+                "{url} answered with an HTML page (HTTP {status}), most likely a bot check and \
+                 no verdict on the session"
+            ),
+            ReadFailure::Rejected { status, .. } => format!(
+                "Robinhood's accounts read answered HTTP {status} with no JSON, most likely a \
+                 block at the edge and no verdict on the session"
+            ),
+            other => other.cause(),
+        }
+    }
+
     /// What went wrong, with no remediation attached.
     pub fn cause(&self) -> String {
         match self {
-            ReadFailure::Rejected { status, detail } => format!(
+            ReadFailure::Rejected { status, detail, .. } => format!(
                 "Robinhood rejected the request (HTTP {status}){}",
                 detail
                     .as_deref()
@@ -1018,8 +1073,8 @@ impl ReadFailure {
                     .unwrap_or_default()
             ),
             ReadFailure::Html { status, url } => format!(
-                "expected JSON from {url} but got an HTML page (HTTP {status}) — the session has \
-                 probably lapsed"
+                "expected JSON from {url} but got an HTML page (HTTP {status}) — a bot check \
+                 intervened or the session has lapsed"
             ),
             ReadFailure::Throttled { retry_after } => throttled_message(retry_after.as_deref()),
             ReadFailure::NotFound { url } => format!("HTTP 404 from {url}"),
@@ -1028,20 +1083,67 @@ impl ReadFailure {
     }
 
     /// The error an ordinary read reports: the cause, plus the login advice
-    /// for the auth-class failures.
+    /// for the auth-class failures. An HTML 403 or a bare 403 is a block at the edge
+    /// and puts the sign-in last ([`edge_block_advice`]). HTML on any other status is
+    /// also what a session logged out elsewhere answers, and that session is older than
+    /// the moment it was written, so both remedies are named
+    /// ([`logged_out_or_blocked_advice`]). All of these are exit 3.
     pub fn into_cli_error(self) -> CliError {
         let cause = self.cause();
+        if self.is_edge_shaped() {
+            return CliError::Auth(match self {
+                ReadFailure::Html { status, .. } if status != 403 => {
+                    format!("{cause}. {}", logged_out_or_blocked_advice(RELOGIN))
+                }
+                ReadFailure::Html { .. } => format!(
+                    "{}. {}",
+                    self.inconclusive_cause(),
+                    edge_block_advice(RELOGIN)
+                ),
+                _ => format!("{cause}. {}", edge_block_advice(RELOGIN)),
+            });
+        }
         match self {
-            ReadFailure::Rejected { .. } => {
-                CliError::Auth(format!("{cause} — run `rhd auth login --browser`"))
-            }
-            ReadFailure::Html { .. } => {
-                CliError::Auth(format!("{cause}; run `rhd auth login --browser`"))
-            }
+            ReadFailure::Rejected { .. } => CliError::Auth(format!("{cause} — run `{RELOGIN}`")),
+            ReadFailure::Html { .. } => CliError::Auth(format!("{cause}; run `{RELOGIN}`")),
             ReadFailure::NotFound { .. } => CliError::NotFound(cause),
             ReadFailure::Throttled { .. } | ReadFailure::Upstream(_) => CliError::Upstream(cause),
         }
     }
+}
+
+/// The login that replaces a stored session.
+const RELOGIN: &str = "rhd auth login --browser --overwrite";
+
+/// How [`edge_block_advice`] opens, so a caller can tell that this advice is already in
+/// an error and not ask for a sign-in beside it.
+pub const SIGN_IN_MAY_NOT_HELP: &str =
+    "A new sign-in may not help, because a block like this is on the client rather than the \
+     session";
+
+/// What to do about an answer shaped like a block at the edge. Signing in does not clear
+/// a block on this client, and each attempt spends a sign-in and replaces the stored
+/// session, so the sign-in comes last. One text, so a sign-in's warning, a later read's
+/// error for a 403 and a renewal's send the owner the same way. `login` is the command,
+/// with `--profile` where the caller knows it.
+pub fn edge_block_advice(login: &str) -> String {
+    format!(
+        "{SIGN_IN_MAY_NOT_HELP}: wait or try another network, and only if reads still fail \
+         after that, run `{login}`."
+    )
+}
+
+/// How [`logged_out_or_blocked_advice`] opens, so the MCP server can give the same fix.
+pub const IF_LOGGED_OUT_ELSEWHERE: &str = "If this session was logged out or revoked elsewhere";
+
+/// What to do about an HTML page on an ordinary read when the status does not settle it.
+/// A stored session logged out in another browser tab answers just as a bot check does
+/// (docs/api.md §4.1), and only a sign-in helps that one, so waiting is not put first.
+pub fn logged_out_or_blocked_advice(login: &str) -> String {
+    format!(
+        "{IF_LOGGED_OUT_ELSEWHERE}, sign in now with `{login}`. Otherwise a bot check may clear \
+         after waiting."
+    )
 }
 
 /// Map a response onto the exit-code contract, treating HTML as an auth
@@ -1063,28 +1165,39 @@ fn read_json(resp: reqwest::blocking::Response) -> Result<Value, ReadFailure> {
 
 /// Classify a response from its parts. Pure, so the mapping is testable
 /// without a network.
-fn classify(
+pub(crate) fn classify(
     status: u16,
     url: &str,
     retry_after: Option<String>,
     text: &str,
 ) -> Result<Value, ReadFailure> {
+    let body = || serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    // A throttle or an outage says nothing about the session, whatever its body,
+    // and an edge answers both with HTML. Read as a refusal, it would renew the
+    // session for nothing, and leave a browser sign-in waiting out its timeout on
+    // a session that may be live.
+    if status == 429 {
+        return Err(ReadFailure::Throttled { retry_after });
+    }
+    if (500..600).contains(&status) {
+        return Err(ReadFailure::Upstream(format!(
+            "Robinhood returned HTTP {status}{}",
+            detail_suffix(&body())
+        )));
+    }
     // A lapsed session frequently comes back as a login page with a 200, not a
-    // 401 — so shape, not status, decides.
+    // 401 — so from here shape, not status, decides.
     if looks_like_html(text) {
         return Err(ReadFailure::Html {
             status,
             url: url.to_string(),
         });
     }
-    if status == 429 {
-        return Err(ReadFailure::Throttled { retry_after });
-    }
-    let body = || serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
     if status == 401 || status == 403 {
         return Err(ReadFailure::Rejected {
             status,
             detail: provider_detail(&body()).map(str::to_string),
+            json_body: serde_json::from_str::<Value>(text).is_ok(),
         });
     }
     if status == 404 {
@@ -1126,11 +1239,71 @@ fn throttled_message(retry_after: Option<&str>) -> String {
     }
 }
 
-fn parse_json(text: &str, status: u16) -> Result<Value, CliError> {
+/// An HTML answer to a password login. The browser sign-in is the way around it, since
+/// it does not go through this client.
+fn html_at_login(status: u16) -> CliError {
+    CliError::Auth(format!(
+        "expected JSON but got an HTML page (HTTP {status}) — run `{RELOGIN}`"
+    ))
+}
+
+/// An HTML answer to a renewal, which is a read of the token endpoint: a block on this
+/// client outlasts a new sign-in ([`edge_block_advice`]), so it comes last unless the
+/// answer refuses the token. An ordinary read names a second remedy for a session logged
+/// out elsewhere, because a login page is known there. This is a POST to an API endpoint,
+/// and nothing records it answering a logged-out session with a page.
+fn html_at_renewal(status: u16) -> CliError {
+    if status == 401 {
+        return html_at_login(status);
+    }
+    CliError::Auth(format!(
+        "expected JSON from the session renewal but got an HTML page (HTTP {status}), most \
+         likely a bot check. {}",
+        edge_block_advice(RELOGIN)
+    ))
+}
+
+/// What the token endpoint's answer says. Pure, so it is testable without a network.
+///
+/// A throttle or an outage is read by its status first, whatever its body, as
+/// [`classify`] reads an ordinary read. It says nothing about the session, so it asks for
+/// no sign-in: one would be spent for nothing and, during an outage, would replace a
+/// session whose refresh token may still work.
+fn token_answer(
+    status: u16,
+    retry_after: Option<&str>,
+    text: &str,
+    on_html: fn(u16) -> CliError,
+) -> Result<Value, CliError> {
+    if status == 429 {
+        return Err(throttled(retry_after));
+    }
+    if (500..600).contains(&status) {
+        let v = serde_json::from_str(text).unwrap_or(Value::Null);
+        return Err(login_error(&v, status));
+    }
+    let v = parse_json(text, status, on_html)?;
+    // A 4xx that still carries a challenge/workflow is the flow working as
+    // designed, so those are handed back rather than raised as errors.
+    if (200..300).contains(&status)
+        || v.get("challenge").is_some()
+        || v.get("verification_workflow").is_some()
+        || v.get("mfa_required").is_some()
+    {
+        return Ok(v);
+    }
+    Err(login_error(&v, status))
+}
+
+/// The token endpoint's answer to a renewal, for a test outside this module.
+#[cfg(test)]
+pub(crate) fn renewal_answer(status: u16, text: &str) -> Result<Value, CliError> {
+    token_answer(status, None, text, html_at_renewal)
+}
+
+fn parse_json(text: &str, status: u16, on_html: fn(u16) -> CliError) -> Result<Value, CliError> {
     if looks_like_html(text) {
-        return Err(CliError::Auth(format!(
-            "expected JSON but got an HTML page (HTTP {status}) — run `rhd auth login --browser`"
-        )));
+        return Err(on_html(status));
     }
     if text.trim().is_empty() {
         return Ok(Value::Null);
@@ -1482,13 +1655,13 @@ mod tests {
 
     #[test]
     fn html_is_treated_as_a_lapsed_session_not_as_data() {
-        let err = parse_json("<!DOCTYPE html><html>login</html>", 200).unwrap_err();
+        let err = parse_json("<!DOCTYPE html><html>login</html>", 200, html_at_login).unwrap_err();
         assert_eq!(err.exit_code(), 3, "200-with-HTML is an auth failure");
     }
 
     #[test]
     fn an_empty_body_parses_as_null_rather_than_failing() {
-        assert_eq!(parse_json("", 200).unwrap(), Value::Null);
+        assert_eq!(parse_json("", 200, html_at_login).unwrap(), Value::Null);
     }
 
     #[test]
@@ -1619,7 +1792,7 @@ mod tests {
             "SAMPLE-READONLY-SECRET",
             "d0d0",
         ] {
-            assert!(!shown.contains(secret), "Debug printed {secret}: {shown}");
+            assert!(!shown.contains(secret), "Debug printed a secret");
         }
         // Still useful for debugging: the non-secret fields show.
         assert!(shown.contains("WebAuthState"), "{shown}");
@@ -1650,7 +1823,8 @@ mod tests {
         let err = rejected.into_cli_error();
         assert_eq!(err.exit_code(), 3);
         assert!(
-            err.to_string().contains("run `rhd auth login --browser`"),
+            err.to_string()
+                .contains("run `rhd auth login --browser --overwrite`"),
             "{err}"
         );
 
@@ -1671,12 +1845,180 @@ mod tests {
         assert_eq!(down.cause(), "Robinhood returned HTTP 503: maintenance");
         assert_eq!(down.into_cli_error().exit_code(), 5);
 
+        // A throttle or an outage is no verdict on the session, whatever its
+        // body. On an ordinary read, HTML on any other status is still an auth
+        // failure, exit 3.
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let throttled = classify(429, url, Some("51".into()), PAGE).unwrap_err();
+        assert!(matches!(throttled, ReadFailure::Throttled { .. }));
+        for status in [500, 502, 503, 504] {
+            let down = classify(status, url, None, PAGE).unwrap_err();
+            assert!(!down.is_auth(), "{status}");
+            assert_eq!(down.into_cli_error().exit_code(), 5, "{status}");
+        }
+        assert!(classify(403, url, None, PAGE).unwrap_err().is_auth());
+
         assert_eq!(
             classify(200, url, None, r#"{"results":[]}"#).unwrap(),
             json!({"results": []})
         );
         assert_eq!(classify(200, url, None, "").unwrap(), Value::Null);
         assert!(!classify(200, url, None, "{nope").unwrap_err().is_auth());
+    }
+
+    /// Only a 401 or Robinhood's own JSON refuses a token for certain. What an ordinary
+    /// read takes as an auth failure can still be no verdict.
+    #[test]
+    fn only_a_401_or_the_providers_json_is_a_definite_refusal() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let url = "https://api.robinhood.com/accounts/";
+        for (status, body) in [
+            (401, "{}"),
+            (401, ""),
+            (401, "Unauthorized"),
+            (401, PAGE),
+            (403, "{}"),
+            (403, r#"{"detail":"dummy refusal"}"#),
+        ] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(failure.is_auth(), "{status} {body}");
+            assert!(failure.definite_refusal().is_some(), "{status} {body}");
+        }
+        for (status, body) in [(200, PAGE), (403, PAGE), (403, ""), (403, "Forbidden")] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(failure.is_auth(), "{status} {body}");
+            assert_eq!(failure.definite_refusal(), None, "{status} {body}");
+            let why = failure.inconclusive_cause();
+            assert!(why.contains(&format!("HTTP {status}")), "{why}");
+            assert!(why.contains("no verdict"), "{why}");
+            assert!(!why.contains("lapsed"), "{why}");
+        }
+    }
+
+    /// An ordinary read's error for an answer shaped like a block at the edge says what
+    /// a sign-in's warning says, at the same exit code. A definite refusal names the
+    /// login at once.
+    #[test]
+    fn an_edge_shaped_read_puts_the_sign_in_last_unless_it_was_refused() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let url = "https://example.test/dummy";
+        for (status, body) in [(403, PAGE), (403, ""), (403, "Forbidden")] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(failure.is_edge_shaped(), "{status} {body}");
+            let err = failure.into_cli_error();
+            assert_eq!(err.exit_code(), 3, "{status} {body}: {err}");
+            let text = err.to_string();
+            assert!(text.contains(&edge_block_advice(RELOGIN)), "{text}");
+            assert!(!text.contains("lapsed"), "{text}");
+            let wait = text.find("wait or try another network").unwrap();
+            let login = text.find(&format!("`{RELOGIN}`")).unwrap();
+            assert!(wait < login, "{text}");
+        }
+        // The same page on a read of a session logged out elsewhere: waiting would not
+        // help that one, so the sign-in is not put last.
+        for status in [200, 404] {
+            let failure = classify(status, url, None, PAGE).unwrap_err();
+            assert!(failure.is_edge_shaped(), "{status}");
+            let err = failure.into_cli_error();
+            assert_eq!(err.exit_code(), 3, "{status}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.contains(&logged_out_or_blocked_advice(RELOGIN)),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "logged out or revoked elsewhere, sign in now with `{RELOGIN}`"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains("Otherwise a bot check may clear after waiting"),
+                "{text}"
+            );
+            assert!(!text.contains(SIGN_IN_MAY_NOT_HELP), "{text}");
+        }
+        for (status, body) in [
+            (401, PAGE),
+            (401, ""),
+            (403, "{}"),
+            (403, r#"{"detail":"dummy refusal"}"#),
+        ] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(!failure.is_edge_shaped(), "{status} {body}");
+            let err = failure.into_cli_error();
+            assert_eq!(err.exit_code(), 3, "{status} {body}: {err}");
+            let text = err.to_string();
+            assert!(text.contains(&format!("run `{RELOGIN}`")), "{text}");
+            assert!(!text.contains(SIGN_IN_MAY_NOT_HELP), "{text}");
+        }
+        for failure in [
+            classify(429, url, None, PAGE).unwrap_err(),
+            classify(503, url, None, PAGE).unwrap_err(),
+            classify(200, url, None, "{nope").unwrap_err(),
+            classify(404, url, None, "{}").unwrap_err(),
+        ] {
+            assert!(!failure.is_edge_shaped(), "{failure:?}");
+        }
+    }
+
+    /// A renewal is a read of the token endpoint, so an HTML page there puts the sign-in
+    /// last too. The password login's remedy is the browser sign-in, so it keeps naming it.
+    #[test]
+    fn html_at_a_renewal_puts_the_sign_in_last() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        for status in [200, 403] {
+            let err = token_answer(status, None, PAGE, html_at_renewal).unwrap_err();
+            assert_eq!(err.exit_code(), 3, "{err}");
+            assert!(
+                err.to_string().contains(&edge_block_advice(RELOGIN)),
+                "{err}"
+            );
+        }
+        for err in [
+            token_answer(401, None, PAGE, html_at_renewal).unwrap_err(),
+            token_answer(403, None, PAGE, html_at_login).unwrap_err(),
+        ] {
+            assert_eq!(err.exit_code(), 3, "{err}");
+            assert!(
+                err.to_string().ends_with(&format!("run `{RELOGIN}`")),
+                "{err}"
+            );
+        }
+        // A throttle or an outage says nothing about the session, at a renewal or at a
+        // password login, so it is exit 5 with no sign-in, whatever its body.
+        for on_html in [html_at_renewal as fn(u16) -> CliError, html_at_login] {
+            for status in [429, 500, 502, 503, 599] {
+                for body in [PAGE, "", "Service Unavailable", "{}"] {
+                    let err = token_answer(status, None, body, on_html).unwrap_err();
+                    assert_eq!(err.exit_code(), 5, "{status} {body}: {err}");
+                    assert!(
+                        !err.to_string().contains("auth login"),
+                        "{status} {body}: {err}"
+                    );
+                }
+            }
+            let down = token_answer(503, None, r#"{"detail":"dummy outage"}"#, on_html);
+            assert!(down.unwrap_err().to_string().contains("dummy outage"));
+        }
+    }
+
+    /// The token endpoint's other answers are read as they were.
+    #[test]
+    fn a_token_answer_hands_back_the_flow_and_raises_a_refusal() {
+        for (status, body) in [
+            (200, r#"{"access_token":"dummy"}"#),
+            (400, r#"{"verification_workflow":{"id":"dummy"}}"#),
+            (400, r#"{"challenge":{"id":"dummy"}}"#),
+            (403, r#"{"mfa_required":true}"#),
+        ] {
+            assert!(
+                token_answer(status, None, body, html_at_login).is_ok(),
+                "{status} {body}"
+            );
+        }
+        let refused = token_answer(400, None, r#"{"detail":"dummy"}"#, html_at_login).unwrap_err();
+        assert_eq!(refused.exit_code(), 3, "{refused}");
     }
 
     /// The pacing rail: two back-to-back calls must be spaced, or a paginated

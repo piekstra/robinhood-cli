@@ -140,10 +140,11 @@ enum AuthCmd {
     /// Sign in through a Chrome window with --browser; --session-stdin and
     /// the password login are the fallbacks.
     ///
-    /// --browser opens https://robinhood.com/login in a throwaway Chrome
-    /// profile. You sign in there, and rhd reads the session the web app
-    /// stores, closes the window, proves the session with one read of your
-    /// accounts, and keeps it in the OS keychain (docs/api.md §2.8).
+    /// --browser opens https://robinhood.com/login in a Chrome profile rhd
+    /// keeps for this login. You sign in there, rhd checks the session the web app
+    /// stores with one read of your accounts, closes the window, and keeps it in
+    /// the OS keychain, unverified with a warning if that read cannot decide
+    /// (docs/api.md §2.8). --overwrite replaces a stored session.
     ///
     /// Without Chrome, --session-stdin imports a session you copy out of
     /// DevTools in your own browser. With neither flag, rhd logs in with the
@@ -152,7 +153,15 @@ enum AuthCmd {
     Login(RhLoginArgs),
     /// Report credential/session state (auth-status/v1).
     Status(StatusArgs),
-    /// Clear the cached session; --forget also removes stored credentials.
+    /// Clear the session and remove the kept browser profile.
+    ///
+    /// --forget also removes stored credentials and this login's config entry.
+    /// Every step is attempted even after one fails; then this says what is cleared
+    /// and what remains, and exits with the first failure's code. While Chrome is
+    /// using the kept profile that is exit 1, with the rest already cleared. The
+    /// config entry goes last, only once the rest is clear, so a retry finds it.
+    /// A login named with --profile runs every step even if the config does not know
+    /// it, so what a failed first sign-in left can be removed.
     Logout(LogoutArgs),
     /// Raw keychain write for rotation / headless setup.
     SetCredential(SetCredentialArgs),
@@ -171,7 +180,10 @@ enum AuthCmd {
     .long_help(BROWSER_HELP)
     .conflicts_with_all([
         "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
-    ])))]
+    ])),
+    // No login path reads it: the password login always reads first. It still parses,
+    // so a script that passes it keeps working.
+    mut_arg("no_verify", |a| a.hide(true)))]
 struct RhLoginArgs {
     #[command(flatten)]
     browser: BrowserArgs,
@@ -215,14 +227,28 @@ const BROWSER_HELP: &str = "\
 Sign in through a Chrome window and capture the session from it: the
 password and any code are entered on Robinhood's own page, never in rhd.
 
-rhd starts Chrome with a throwaway profile at https://robinhood.com/login.
-Sign in there, answering any code or approval Robinhood asks for. Once
-the robinhood.com page holds a session, rhd reads it from that page only
-(localStorage['web:auth_state'], plus the device_id cookie) and closes
-the tab at once, so the web app cannot renew the session out from under
-rhd. Then it quits Chrome, deletes the profile, reads your accounts once
-with the session, and stores it in the OS keychain only if that read
-succeeds. It never prints the token.
+rhd starts Chrome at https://robinhood.com/login in a profile it keeps for
+this login, separate from every other login's. Sign in there, answering any
+code or approval Robinhood asks for. Once the robinhood.com page holds a
+session Robinhood does not refuse, which one read of your accounts decides,
+rhd takes it from that page only (localStorage['web:auth_state'], plus the
+device_id cookie) and closes the tab at once, so the web app cannot renew
+the session out from under rhd. Then it quits Chrome and stores the session
+in the OS keychain, with no second read. It never prints the token.
+
+If that read cannot decide (a bot check, Robinhood throttled or down), rhd
+stores the session anyway, since the page held the only copy, and warns even
+under -q that it is unverified. If reads keep failing, run `rhd auth login
+--browser --overwrite`; after a bot check, wait or try another network first,
+since a new sign-in may not help. With a session already stored for this login,
+--browser stops before Chrome opens; pass --overwrite to replace it.
+
+The kept profile lets Robinhood remember this device, so a later sign-in
+often asks for less. It is a full Chrome profile, owner-only on disk:
+Robinhood's cookies, browsing history with full URLs and the HTTP cache stay,
+after a failed sign-in too, until `rhd auth logout` removes it. The session's
+tokens do not: site storage goes before Chrome starts and again once it stops.
+--fresh-profile signs in through a scratch profile instead.
 
 Waits up to 10 minutes; Ctrl-C cancels. Chrome, Chromium or Edge is found
 at the standard install paths; set RHD_CHROME to use another binary.
@@ -293,7 +319,11 @@ enum ProfilesCmd {
         #[arg(long, value_name = "ID")]
         account: Option<String>,
     },
-    /// Remove a login profile and its stored credentials.
+    /// Remove a login profile, its credentials and its kept browser profile.
+    ///
+    /// Every step is attempted even after one fails; then this says what is cleared
+    /// and what remains, and exits with the first failure's code. The config entry
+    /// goes last, only once the rest is clear, so a retry finds it.
     Remove {
         name: String,
         /// Remove without confirmation.
@@ -552,6 +582,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
     }
 
     let store = ConfigStore::new(BIN).with_override(cli.config.clone());
+    if let Command::Auth(AuthCmd::Logout(args)) = &cli.command {
+        return auth_logout(cli, &store, args);
+    }
     let cfg: Config = store.load()?;
 
     match &cli.command {
@@ -742,12 +775,25 @@ fn validate(command: &Command) -> Result<(), CliError> {
     }
 }
 
+/// `auth logout`, which neither a config that cannot be parsed nor a name it does not
+/// know may stop ([`commands::auth::logout_target`]).
+fn auth_logout(cli: &Cli, store: &ConfigStore, args: &LogoutArgs) -> Result<(), CliError> {
+    let cfg: Result<Config, CliError> = store.load();
+    let profile = commands::auth::logout_target(&cfg, cli.profile.as_deref())?;
+    commands::auth::logout(&cli.common, store, cfg, &profile, args.forget)
+}
+
 fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Result<(), CliError> {
     let profile = cfg.require_profile(cli.profile.as_deref())?;
     match cmd {
-        AuthCmd::Login(args) if args.browser.browser => {
-            commands::auth::browser_login(&cli.common, store, cfg, &profile)
-        }
+        AuthCmd::Login(args) if args.browser.browser => commands::auth::browser_login(
+            &cli.common,
+            store,
+            cfg,
+            &profile,
+            args.browser.fresh_profile,
+            args.base.overwrite,
+        ),
         AuthCmd::Login(args) if args.session_stdin => commands::auth::import_session(
             &cli.common,
             store,
@@ -775,9 +821,7 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Resul
             cli.account.as_deref(),
             args.verify,
         ),
-        AuthCmd::Logout(args) => {
-            commands::auth::logout(&cli.common, store, cfg, &profile, args.forget)
-        }
+        AuthCmd::Logout(_) => unreachable!("served before the config is loaded"),
         AuthCmd::SetCredential(args) => {
             commands::auth::set_credential(&cli.common, store, cfg, &profile, args)
         }
@@ -834,6 +878,20 @@ fn cmd_to_config_op(cmd: &ConfigCmd) -> commands::misc::ConfigOp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--no-verify` is hidden, not gone: a script that passes it keeps working, and it
+    /// still conflicts with the routes that refuse it.
+    #[test]
+    fn the_hidden_no_verify_still_parses() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["rhd", "auth", "login"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(parse(&["--no-verify"]).is_ok());
+        assert!(parse(&["--no-verify", "--browser"]).is_err());
+        assert!(parse(&["--no-verify", "--session-stdin"]).is_err());
+    }
 
     /// clap's own debug assertions catch conflicting shorts (e.g. a
     /// subcommand `-a` shadowing the global `--account`) only when the command
