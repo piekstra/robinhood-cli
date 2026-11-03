@@ -48,9 +48,9 @@ pub fn login(
     let creds = CredentialStore::for_binary(config::BIN);
     let rh = Rh::new()?;
 
+    let username = resolve_username(&cfg, profile, input, common)?;
     // Before anything is spent: an approval or a code cannot be had twice.
     RefreshLock::for_binary(config::BIN)?.before_signin()?;
-    let username = resolve_username(&cfg, profile, input, common)?;
     let password = resolve_password(&creds, profile, input, common)?;
 
     // A code (or an explicit --resume) belongs to the attempt that raised the
@@ -312,8 +312,9 @@ pub fn import_session(
     profile: &str,
     non_interactive: bool,
 ) -> Result<(), CliError> {
-    // Before the read: a session piped in once cannot be read again.
-    RefreshLock::for_binary(config::BIN)?.before_signin()?;
+    // Before the read: a session piped in once cannot be read again. It does not
+    // wait on a busy lock, so bad input still fails at once; the store waits.
+    RefreshLock::for_binary(config::BIN)?.try_hold(|| Ok(()))?;
     let raw = read_capture(common, non_interactive)?;
     import(common, store, cfg, profile, &raw, Source::Stdin)
 }
