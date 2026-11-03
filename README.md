@@ -321,13 +321,24 @@ server running, and the `HOME_ROBINHOOD_TOKEN` secret, with the threat
 model. `--http` binds 127.0.0.1 only, refuses to start without the token,
 refuses any request whose `Host` is not loopback or that carries an
 `Origin`, and serves the read-only tools only. The session never leaves your
-computer. While the computer sleeps, the tools answer that it is offline.
+computer, but tool results do: your balances, positions and activity pass
+through Cloudflare and reach Claude ([`SECURITY.md`](SECURITY.md)). While the
+computer sleeps, the tools answer that it is offline.
+
+After `rhd self-update`, restart the server: a running one keeps the old code,
+and its launchd agent restarts it only when it exits. Its start line names the
+version.
+
+```console
+$ launchctl kickstart -k gui/$(id -u)/com.piekstra.rhd-mcp-http
+```
 
 ## Security
 
 Passwords, OAuth tokens (including a session from a browser), and device
 tokens live only in the OS keychain (`piekstra.rhd`), namespaced per profile.
-Nothing sensitive is ever accepted on argv or written to disk. A browser
+Nothing sensitive is ever accepted on argv or written to disk. With `rhd mcp
+--http`, its bearer token also lives in your Cloudflare Worker. A browser
 session arrives from the sign-in window over Chrome's DevTools protocol
 (`--browser`, whose throwaway profile is deleted afterwards) or on stdin
 (`--session-stdin`). See [`SECURITY.md`](SECURITY.md).

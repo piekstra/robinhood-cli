@@ -15,6 +15,7 @@
 //!   can't fetch anything leaves nothing broken behind. That holds for a
 //!   session from a browser (`--browser`, `--session-stdin`) too.
 
+use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
 use pk_cli_browser::{BrowserError, Launch};
 use pk_cli_config::ConfigStore;
@@ -186,7 +187,7 @@ fn finish(
         None,
     )?;
 
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    store_session(creds, profile, &tokens)?;
     creds.set(
         &config::device_key(profile),
         &Secret::new(device_token.to_string()),
@@ -348,7 +349,7 @@ fn import(
     })?;
 
     let creds = CredentialStore::for_binary(config::BIN);
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    store_session(&creds, profile, &tokens)?;
     // A captured session names no username; the proving read was one page.
     record_profile(store, &mut cfg, profile, None, &visible, !more)?;
 
@@ -558,6 +559,13 @@ pub fn status(
     Ok(())
 }
 
+/// Store a session a login obtained, under the lock a renewal holds, so a
+/// renewal in flight cannot overwrite it with the old session's tokens.
+fn store_session(creds: &CredentialStore, profile: &str, tokens: &Tokens) -> Result<(), CliError> {
+    RefreshLock::for_binary(config::BIN)?
+        .hold(|| creds.set(&config::token_key(profile), &tokens.to_secret()))
+}
+
 pub fn logout(
     common: &CommonArgs,
     store: &ConfigStore,
@@ -568,8 +576,9 @@ pub fn logout(
     let creds = CredentialStore::for_binary(config::BIN);
 
     // The cached session and any half-finished login always go; `logout`
-    // that leaves a resumable attempt behind isn't a logout.
-    creds.delete(&config::token_key(profile))?;
+    // that leaves a resumable attempt behind isn't a logout. Under the lock a
+    // renewal holds, so one in flight cannot store the session again after.
+    RefreshLock::for_binary(config::BIN)?.hold(|| creds.delete(&config::token_key(profile)))?;
     creds.delete(&config::pending_key(profile))?;
 
     if forget {

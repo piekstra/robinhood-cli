@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.15.1"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.17.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -110,8 +110,13 @@ not value the first two, and there is no realized-gain endpoint. The tools
 read through the `Source` trait at the level of raw rows, and map them with
 the commands' own `from_json`, `verified_holdings`, `account_row` and
 `rollup`, so a tool and its command cannot disagree. `LiveSource` holds one
-`Ctx` and makes one read at a time, because a refresh rotates the stored
-refresh token and two refreshing at once would present the same one twice.
+`Ctx` and makes one read at a time. A refresh rotates the stored refresh
+token, and two refreshing at once would present the same one twice, so
+`Ctx::access_token` renews under `pk_cli_auth::refresh_lock::RefreshLock`
+(`~/.config/rhd/token-refresh.lock`, holding nothing) against every other
+`rhd` process, re-reads the session once it holds the lock, and posts no grant
+if the session is no longer expired. A login and a logout hold it around their
+keychain write only, never across the sign-in.
 The tools never sign in: an auth error asks the user to run
 `rhd auth login --browser --profile <NAME>` in a terminal. A profile that
 cannot be chosen (several, no default) fails each call, not the server.
@@ -131,7 +136,9 @@ cannot be chosen (several, no default) fails each call, not the server.
   connector's home module (`HOME_ROBINHOOD`); `tests/mcp_http.rs` drives it
   with the token in `RHD_MCP_TOKEN` and a scratch config with two profiles
   and none selected, so its tool call stops on choosing a profile and it
-  reads no keychain.
+  reads no keychain. It outlives `self-update`, whose note
+  (`pk_cli_mcp::restart_note`) tells the owner to restart it; its start line
+  names the version.
 
 ## Non-negotiables
 

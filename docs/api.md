@@ -207,6 +207,15 @@ refresh response comes back carrying a `verification_workflow`, the refresh
 token itself is dead and a full login is required; `rhd` reports that as an auth
 error naming `rhd auth login --browser`.
 
+Every `rhd` process shares that token: the long-running `mcp --http` server, a
+stdio server and a terminal command read one keychain item. So a renewal runs
+under an exclusive lock on `~/.config/rhd/token-refresh.lock` (an empty file;
+`pk_cli_auth::refresh_lock`, whatever `--config` or `XDG_CONFIG_HOME` say). It
+reads the session again once it holds the lock, and if the session is no longer
+expired another process has renewed: it posts no grant and uses that process's
+tokens. A wait is bounded at 75 s, then exit 5 naming the lock, with nothing
+sent. All profiles share the one lock.
+
 The `device_token` sent is the one the session was issued to. For a password
 session that is the profile's `<profile>/device`; for a session from a browser
 (§2.8) it is the browser's `device_id`, kept inside the token bundle — or
