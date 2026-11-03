@@ -45,10 +45,18 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
   stopped; after a crash or a second Ctrl-C, the next launch removes it. Its cookies
   stay, and Chrome now quits over its debug port, so a fresh one reaches the disk.
 - The capture now takes a session only once it is short of `rhd`'s renewal point and
-  Robinhood accepts it. That is its one read: the accounts page it got is the proof, and
-  the session goes straight to the keychain. A token Robinhood refused is not sent
-  again, and a timeout says what the read answered, so a bot check names itself. A
-  throttle or an outage during that check ends the wait with an error.
+  Robinhood has not refused it. That is its one read: the accounts page it got is the
+  proof, and the session goes straight to the keychain. A token Robinhood refused with a
+  401 or its own JSON is not sent again, and a timeout says what the read answered.
+- If that read cannot decide (a bot check's page, a throttle, an outage, a dropped
+  connection, an answer that is not the accounts list), the sign-in is kept: the session
+  is stored, the exit is 0, `--json` adds `verified: false`, and a warning says why, even
+  under `-q`, that it is unverified, and that if reads keep failing, `rhd auth login
+  --browser --overwrite` is the way out.
+- `rhd auth login --browser` now refuses before Chrome opens, exit 2, when this login
+  already has a stored session and `--overwrite` was not passed. It used to replace the
+  stored session with no flag. Messages that send you back to sign in with a session
+  stored now name `--overwrite`.
 - Before going back to an older release, run `rhd auth logout --profile <NAME>` for each
   login. An older release does not know the kept profiles and its logout leaves them
   behind; otherwise delete

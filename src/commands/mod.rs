@@ -255,13 +255,13 @@ impl Ctx {
         CliError::Auth(match tokens.origin {
             Origin::Bearer => format!(
                 "the browser session imported into `{p}` has expired — a bare bearer token \
-                 cannot be renewed; sign in again with `rhd auth login --browser --profile \
-                 {p}`, which stores the renewable web:auth_state shape",
+                 cannot be renewed; sign in again with `rhd auth login --browser --overwrite \
+                 --profile {p}`, which stores the renewable web:auth_state shape",
                 p = self.profile
             ),
             _ => format!(
                 "the cached session for `{p}` expired and carries no refresh token — run \
-                 `rhd auth login --browser --profile {p}`",
+                 `rhd auth login --browser --overwrite --profile {p}`",
                 p = self.profile
             ),
         })

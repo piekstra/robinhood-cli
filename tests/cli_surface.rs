@@ -373,6 +373,25 @@ fn a_profile_name_too_long_for_a_browser_profile_cannot_be_added() {
         .code(2);
 }
 
+/// `--overwrite` is how a stored session is replaced, so `--browser` takes it. This
+/// stops at the missing Chrome, which also keeps it off the keychain.
+#[test]
+fn browser_takes_overwrite() {
+    let config = scratch_config("browseroverwrite");
+    let _ = std::fs::remove_file(&config);
+    let mut cmd = rhd();
+    cmd.arg("--config")
+        .arg(&config)
+        .env_remove("RHD_PROFILE")
+        .env_remove("RHD_ACCOUNT")
+        .env("RHD_CHROME", NO_CHROME);
+    piped(cmd)
+        .args(["auth", "login", "--browser", "--overwrite"])
+        .assert()
+        .code(1)
+        .stderr(contains("RHD_CHROME"));
+}
+
 /// `--browser` takes the session from the window: any other credential
 /// source or password-login flag beside it is a usage error at parse time,
 /// before config, keychain or network (and before Chrome).

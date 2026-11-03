@@ -23,9 +23,11 @@ per profile:
   it mints new access tokens without re-authenticating. A session from a
   signed-in browser is stored here too, with the browser's `device_id`. It
   arrives from the sign-in window (`auth login --browser`) or on stdin
-  (`--session-stdin`, or a hidden paste on a terminal), is proved with one
-  read before it is written, and is never echoed — not in output, not in an
-  error message.
+  (`--session-stdin`, or a hidden paste on a terminal), gets one read before
+  it is written, and is never echoed — not in output, not in an error message.
+  A session on stdin is stored only if that read proves it. One from the window
+  is stored unless the read refuses it, with a warning if the read could not
+  decide (below).
 - **The sign-in window** (`auth login --browser`), while it is open. Chrome's
   DevTools port on `127.0.0.1` has no authentication, so a local process that
   finds it can read every cookie in the window. `rhd` reads the session from
@@ -77,8 +79,8 @@ Desktop) over stdio, on this machine only; it opens no port unless run with
 `--http` (below). It uses the
 selected profile's session already in the keychain, exactly as the commands
 do, refreshing it in place, and never signs in: a missing or lapsed session
-is an error asking the user to run `rhd auth login --browser --profile
-<NAME>` in a terminal. No tool downloads a document or emits a download
+is an error asking the user to run `rhd auth login --browser --overwrite
+--profile <NAME>` in a terminal. No tool downloads a document or emits a download
 link. The Claude Desktop extension (`.mcpb`) takes no settings and so holds
 no credential of its own; on macOS its bundled binary needs the user's
 approval, once, to read the `piekstra.rhd` keychain item.
@@ -185,12 +187,19 @@ starts, where a failure refuses the launch, and again once Chrome has stopped. A
 or a second Ctrl-C skips the second removal, as does a Chrome still running in the
 profile. The tokens are then on disk until the next launch or logout, with only `0700`
 protecting them. The capture only reads. It refuses anything past the point `rhd`
-would renew it, or that Robinhood does not accept. A throttle or an outage during that
-check ends the wait with an error, and takes nothing.
+would renew it, or that Robinhood refuses. A bot check, a throttle or an outage during
+that check takes the session unverified, with a warning, as below.
+
+**A session its one read could not decide on is stored unverified.** A bot check, a
+throttle or an outage on that read does not discard the sign-in: the page held the only
+copy, and a token there can only be this sign-in's, since site storage goes before
+Chrome starts. `rhd` warns on stderr, under `-q` too, and `--browser` refuses before
+Chrome opens if a session is stored and `--overwrite` was not passed, so such a session
+never replaces a stored one without the flag.
 
 **The profile outlives a failed sign-in.** However a sign-in fails once its window
-has opened (a timeout, a closed window, Ctrl-C, Robinhood throttled or down during
-the check, a keychain write that fails), the profile stays with what the sign-in got
+has opened (a timeout, a closed window, Ctrl-C, a keychain write that fails), the
+profile stays with what the sign-in got
 as far as, which can be a live session in its cookies, and the error says so. `rhd
 auth status` says whether that login keeps a profile, not whether anything is signed
 in there.

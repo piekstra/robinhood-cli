@@ -193,7 +193,7 @@ impl<S: Source> RobinhoodTools<S> {
     fn err(&self, e: CliError) -> ToolError {
         match e {
             CliError::Auth(m) => ToolError::auth(m).with_fix(format!(
-                "Ask the user to run `rhd auth login --browser --profile {}` in a terminal, \
+                "Ask the user to run `rhd auth login --browser --overwrite --profile {}` in a terminal, \
                  then call the tool again. Tools never sign in or create credentials themselves",
                 self.profile.as_deref().unwrap_or("<NAME>")
             )),

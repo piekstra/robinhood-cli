@@ -77,8 +77,8 @@ stored the browser sign-in's session (web:auth_state) into profile `primary` —
 renews unattended: the refresh token is stored; the access token is good until …
 ```
 
-As soon as the robinhood.com page holds a session Robinhood accepts, which one read
-of your accounts decides, `rhd` takes it (the web app's `web:auth_state` and its
+As soon as the robinhood.com page holds a session Robinhood does not refuse, which one
+read of your accounts decides, `rhd` takes it (the web app's `web:auth_state` and its
 `device_id` cookie, from robinhood.com only), closes the tab, quits Chrome and stores
 the session in the OS keychain, with no second read; it never prints the token.
 Closing the tab at once matters: the web app and `rhd` would
@@ -109,9 +109,16 @@ which `rhd` removes before Chrome starts and again once Chrome has stopped. A cr
 or a second Ctrl-C skips the second removal; the next launch or `rhd auth logout`
 covers it.
 
+If Robinhood refuses the session, the window stays open for a new sign-in. If the read
+cannot decide (a bot check, Robinhood throttled or down), `rhd` stores the session
+anyway, since the page held the only copy, exits 0, and warns even under `-q` that it is
+unverified; `--json` adds `verified: false`. If reads then keep failing, run `rhd auth
+login --browser --overwrite`. With a session already stored for this login, `--browser`
+stops before Chrome opens unless you pass `--overwrite`.
+
 The profile stays after a failed sign-in too, and every failure once the window has
-opened says so: a timeout, a closed window, Ctrl-C, Robinhood throttled or down
-during the check, a keychain write that fails. Those can leave a live session in
+opened says so: a timeout, a closed window, Ctrl-C, a keychain write that fails. Those
+can leave a live session in
 it. `rhd auth status` says whether that login keeps a profile (`browser_profile`
 with `--json`), not whether anything is signed in there. `rhd auth logout` and `rhd profiles remove` remove it, for
 that login only, and clear its stored session with it. They attempt every step even

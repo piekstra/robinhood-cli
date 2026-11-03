@@ -579,7 +579,8 @@ fn a_missing_session_asks_for_the_browser_login_in_a_terminal() {
         assert!(text.starts_with("auth:"), "{name}: {text}");
         assert!(
             text.contains(
-                "Ask the user to run `rhd auth login --browser --profile household` in a terminal"
+                "Ask the user to run `rhd auth login --browser --overwrite --profile household` \
+                 in a terminal"
             ),
             "{name}: {text}"
         );

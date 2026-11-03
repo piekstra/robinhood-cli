@@ -141,9 +141,10 @@ enum AuthCmd {
     /// the password login are the fallbacks.
     ///
     /// --browser opens https://robinhood.com/login in a Chrome profile rhd
-    /// keeps for this login. You sign in there, rhd proves the session the web app
+    /// keeps for this login. You sign in there, rhd checks the session the web app
     /// stores with one read of your accounts, closes the window, and keeps it in
-    /// the OS keychain (docs/api.md §2.8).
+    /// the OS keychain, unverified with a warning if that read cannot decide
+    /// (docs/api.md §2.8). --overwrite replaces a stored session.
     ///
     /// Without Chrome, --session-stdin imports a session you copy out of
     /// DevTools in your own browser. With neither flag, rhd logs in with the
@@ -226,11 +227,17 @@ password and any code are entered on Robinhood's own page, never in rhd.
 rhd starts Chrome at https://robinhood.com/login in a profile it keeps for
 this login, separate from every other login's. Sign in there, answering any
 code or approval Robinhood asks for. Once the robinhood.com page holds a
-session Robinhood accepts, which one read of your accounts decides, rhd
-takes it from that page only (localStorage['web:auth_state'], plus the
+session Robinhood does not refuse, which one read of your accounts decides,
+rhd takes it from that page only (localStorage['web:auth_state'], plus the
 device_id cookie) and closes the tab at once, so the web app cannot renew
 the session out from under rhd. Then it quits Chrome and stores the session
 in the OS keychain, with no second read. It never prints the token.
+
+If that read cannot decide (a bot check, Robinhood throttled or down), rhd
+stores the session anyway, since the page held the only copy, and warns even
+under -q that it is unverified: if reads keep failing, run `rhd auth login
+--browser --overwrite`. With a session already stored for this login, --browser
+stops before Chrome opens; pass --overwrite to replace it.
 
 The kept profile lets Robinhood remember this device, so a later sign-in
 often asks for less. It is a full Chrome profile, owner-only on disk:
@@ -775,10 +782,14 @@ fn auth_logout(cli: &Cli, store: &ConfigStore, args: &LogoutArgs) -> Result<(), 
 fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Result<(), CliError> {
     let profile = cfg.require_profile(cli.profile.as_deref())?;
     match cmd {
-        AuthCmd::Login(args) if args.browser.browser => {
-            let fresh_profile = args.browser.fresh_profile;
-            commands::auth::browser_login(&cli.common, store, cfg, &profile, fresh_profile)
-        }
+        AuthCmd::Login(args) if args.browser.browser => commands::auth::browser_login(
+            &cli.common,
+            store,
+            cfg,
+            &profile,
+            args.browser.fresh_profile,
+            args.base.overwrite,
+        ),
         AuthCmd::Login(args) if args.session_stdin => commands::auth::import_session(
             &cli.common,
             store,

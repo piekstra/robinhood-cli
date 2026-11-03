@@ -21,7 +21,7 @@
 //! the owner copied out of DevTools. Both hand the text to [`parse`], so they
 //! store identical credentials.
 //!
-//! Pure: no network, no keychain. The caller proves the session with one
+//! Pure: no network, no keychain. The caller checks the session with one
 //! authenticated read before storing anything. No error here ever quotes the
 //! input — it is a credential.
 
@@ -215,8 +215,8 @@ pub fn parse(raw: &str, now: u64, source: Source) -> Result<Captured, CliError> 
                 }
                 Source::Browser => {
                     "the session in the window had expired; sign in again with `rhd auth login \
-                     --browser`, and check this machine's clock if a new session looks expired \
-                     too"
+                     --browser --overwrite`, and check this machine's clock if a new session \
+                     looks expired too"
                 }
             };
             return Err(CliError::Auth(format!(

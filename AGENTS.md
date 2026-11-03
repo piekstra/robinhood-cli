@@ -206,7 +206,9 @@ and a rate-limited one.
   `--browser` opens Chrome at robinhood.com/login in a profile kept per login,
   the owner signs in on Robinhood's page, and `rhd` takes the stored session,
   closes the tab at once (so the web app cannot rotate the refresh token it
-  shares with `rhd`, or log it out), and spends one ordinary read proving it.
+  shares with `rhd`, or log it out), and one ordinary read checks it. A session is
+  stored only with `--overwrite` if one is already there: `refuse_overwrite` stops it
+  before Chrome opens.
   It needs the owner at the window: never run it unattended or from a test.
 - **The kept browser profile.** `Launch::profile_name(<login>)` keeps one per
   login profile, so one household account's sign-in never opens signed in as
@@ -214,7 +216,7 @@ and a rate-limited one.
   turns on `clear_site_storage`: the page keeps the session's tokens in `localStorage`,
   and refresh tokens rotate on every use. Keep it on.
   `commands::auth::confirm_candidate` lets the tab close only on a session short of
-  `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood accepts.
+  `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood does not refuse.
   `capture::SESSION_EXPRESSION` and the Console snippet only read: clearing site
   storage belongs to `clear_site_storage`.
 - **It is a full Chrome profile** (cookies, history with full URLs, HTTP cache),
@@ -225,9 +227,15 @@ and a rate-limited one.
   reports the active login's as `browser_profile` through `browser_profile_status`,
   whose tests fill the seam with `named_profile_exists_in`. It says a profile is kept,
   not that anything is signed in there.
-- **A read that cannot decide ends the wait.** In `confirm_candidate` a 429 or a
-  5xx is `Confirm::Fail`, whatever its body (`client::classify` reads those statuses
-  before the HTML), and only an accounts list is `Ready`.
+- **A read that cannot decide keeps the sign-in.** In `confirm_candidate` only
+  `ReadFailure::definite_refusal` is a refusal (`NotYet`): a 401, or Robinhood's JSON on
+  a 403. An accounts list is `Ready` with the page kept. Anything else is `Ready` with
+  its cause in `WindowMemory::unverified`: `finish_window` stores the session,
+  `session-import/v1` says `verified: false`, and the warning prints under `-q` and
+  `--json` (`SessionImport::notes`). The page held the only copy, so it is stored.
+  `is_auth` stays as it is for ordinary reads, exit 3, and `--session-stdin` stores
+  nothing unless its read proves it. `chrome_is_missing` keeps the surface tests, which
+  stop at a missing `RHD_CHROME`, off the keychain.
 - **`auth logout` and `profiles remove` remove the login's kept profile, and no
   test may reach the real one.** The removal goes through the `logout_browser` seam:
   the binary binds `forget_named_profile(BIN, name)`, tests bind

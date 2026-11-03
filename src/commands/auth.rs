@@ -17,8 +17,11 @@
 //! - **A window's tokens do not stay.** `--browser` runs Chrome in a profile kept per
 //!   login, so a re-login often asks for less. The page keeps the tokens in
 //!   `localStorage`, so [`browser_launch`] turns on `clear_site_storage`. The capture
-//!   only reads ([`capture::SESSION_EXPRESSION`]), and the tab closes only on a session
-//!   Robinhood accepts ([`confirm_candidate`]).
+//!   only reads ([`capture::SESSION_EXPRESSION`]). The tab stays open on a session
+//!   Robinhood refuses, and closes on one it accepts or one its read cannot decide on,
+//!   which is stored unverified with a warning, because the page held the only copy
+//!   ([`confirm_candidate`]). A stored session is refused before Chrome opens unless
+//!   `--overwrite` says to replace it ([`refuse_overwrite`]).
 //! - **The kept profile is a full Chrome profile:** Robinhood's cookies, browsing
 //!   history with full URLs, query strings included, and the HTTP cache. Chrome's
 //!   cookie encryption does not cover anything but the cookies, so the directory's `0700` mode is their only protection, and
@@ -274,7 +277,7 @@ fn note_login(
 ///
 /// The capture answers with the `web:auth_state` JSON the `--session-stdin`
 /// Console snippet copies, so from there it takes the same road:
-/// [`capture::parse`], one proving read, the same keychain item. The crate
+/// [`capture::parse`], one read, the same keychain item. The crate
 /// closes the tab the moment the session is read, so the web app cannot
 /// renew (and so rotate) the refresh token `rhd` is about to store, then
 /// stops Chrome; its profile stays for the next sign-in, unless
@@ -285,8 +288,17 @@ pub fn browser_login(
     cfg: Config,
     profile: &str,
     fresh_profile: bool,
+    overwrite: bool,
 ) -> Result<(), CliError> {
-    let launch = browser_launch(profile, fresh_profile, common.quiet)?;
+    let launch = browser_launch(profile, fresh_profile, overwrite, common.quiet)?;
+    let creds = CredentialStore::for_binary(config::BIN);
+    // With no Chrome to open there is no sign-in to protect, and the keychain is left
+    // alone.
+    if !chrome_is_missing(std::env::var_os("RHD_CHROME")) {
+        refuse_overwrite(profile, overwrite, || {
+            Ok(creds.get(&config::token_key(profile))?.is_some())
+        })?;
+    }
     // Before the window: a sign-in the owner has finished is not thrown away.
     RefreshLock::for_binary(config::BIN)?.before_signin()?;
     let memory = Arc::new(WindowMemory::default());
@@ -299,7 +311,6 @@ pub fn browser_login(
             prove_session,
         )
     });
-    let creds = CredentialStore::for_binary(config::BIN);
     through_the_window(
         profile,
         fresh_profile,
@@ -312,12 +323,37 @@ pub fn browser_login(
     )
 }
 
-/// What the confirm hook remembers across polls: the token Robinhood refused, and
-/// the accounts page it accepted, which is the session's proof.
+/// With a session stored and no `--overwrite`, the sign-in is refused before Chrome
+/// opens. A sign-in the owner has finished is then never thrown away for want of the
+/// flag, and an unverified session never replaces a stored one without it.
+fn refuse_overwrite(
+    profile: &str,
+    overwrite: bool,
+    stored: impl FnOnce() -> Result<bool, CliError>,
+) -> Result<(), CliError> {
+    if !overwrite && stored()? {
+        return Err(CliError::Usage(format!(
+            "login `{profile}` already has a stored session; pass --overwrite to replace it: \
+             `rhd auth login --browser --overwrite --profile {profile}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `RHD_CHROME` names something that is not a file. The crate then ends the
+/// sign-in at "no Chrome", before any window.
+fn chrome_is_missing(named: Option<std::ffi::OsString>) -> bool {
+    named.is_some_and(|path| !std::path::Path::new(&path).is_file())
+}
+
+/// What the confirm hook remembers across polls and hands on: the token Robinhood
+/// refused, the accounts page it accepted, which is the session's proof, and why the
+/// read could not decide on the session it took unverified.
 #[derive(Default)]
 struct WindowMemory {
     refused: Mutex<Option<Refused>>,
     accepted: Mutex<Option<Value>>,
+    unverified: Mutex<Option<String>>,
 }
 
 /// A token Robinhood refused, and what the read said.
@@ -326,9 +362,10 @@ struct Refused {
     reason: String,
 }
 
-/// The window route's end. The page the hook accepted is the proof, so nothing is
-/// read here: by now Chrome has stopped and site storage is gone, and a throttle or a
-/// dropped connection on another read would throw a finished sign-in away.
+/// The window route's end. The page the hook accepted is the proof, or the hook said
+/// why it could not decide, so nothing is read here: by now Chrome has stopped and site
+/// storage is gone, and a throttle or a dropped connection on another read would throw
+/// a finished sign-in away.
 fn finish_window(
     common: &CommonArgs,
     store: &ConfigStore,
@@ -338,15 +375,25 @@ fn finish_window(
     memory: &WindowMemory,
     save: impl FnOnce(&Tokens) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
+    let unverified = memory
+        .unverified
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let page = memory
         .accepted
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    let proven = prove_import(raw, Source::Browser, |_| {
-        page.ok_or_else(|| ReadFailure::Upstream("the confirm hook kept no accounts page".into()))
-    })?;
-    store_import(common, store, cfg, profile, proven, save)
+    let checked = match unverified {
+        Some(why) => unverified_import(raw, why)?,
+        None => prove_import(raw, Source::Browser, |_| {
+            page.ok_or_else(|| {
+                ReadFailure::Upstream("the confirm hook kept no accounts page".into())
+            })
+        })?,
+    };
+    store_import(common, store, cfg, profile, checked, save)
 }
 
 /// A browser sign-in from the window on, with every way it can fail in one
@@ -395,15 +442,19 @@ fn through_the_window(
 /// The page keeps the session's tokens in `localStorage`, and a refresh token left on
 /// disk could be presented by a later window after `rhd` has rotated it. So the kept
 /// profile keeps its cookies, the `device_id` among them, and never its site storage.
-fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Launch, CliError> {
+fn browser_launch(
+    profile: &str,
+    fresh_profile: bool,
+    overwrite: bool,
+    quiet: bool,
+) -> Result<Launch, CliError> {
     let launch = Launch::new(config::BIN)
         .url(capture::LOGIN_URL)
         .clear_site_storage(true)
-        .quiet(quiet);
+        .quiet(quiet)
+        .login_hint(retry_hint(profile, fresh_profile, overwrite));
     if fresh_profile {
-        return Ok(launch.fresh_profile(true).login_hint(format!(
-            "rhd auth login --browser --profile {profile} --fresh-profile"
-        )));
+        return Ok(launch.fresh_profile(true));
     }
     if !config::profile_name_ok(profile) {
         return Err(CliError::Usage(format!(
@@ -412,9 +463,21 @@ fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Lau
              profile with such a name (`rhd profiles add <NAME>`)"
         )));
     }
-    Ok(launch
-        .profile_name(profile)
-        .login_hint(format!("rhd auth login --browser --profile {profile}")))
+    Ok(launch.profile_name(profile))
+}
+
+/// The command a failed sign-in tells the owner to re-run: the same flags, so a retry
+/// that replaces a stored session is not refused for want of `--overwrite`.
+fn retry_hint(profile: &str, fresh_profile: bool, overwrite: bool) -> String {
+    format!(
+        "rhd auth login --browser{} --profile {profile}{}",
+        if overwrite { " --overwrite" } else { "" },
+        if fresh_profile {
+            " --fresh-profile"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Whether the session in the window is one to take, which closes the tab.
@@ -423,17 +486,23 @@ fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Lau
 /// holds was written in this window. Taking a session Robinhood will not honour would
 /// still close the tab before the web app could ask the owner to sign in. So a session
 /// that does not parse, is past the point `rhd` would renew it, or that Robinhood
-/// refuses keeps the tab open.
+/// definitely refuses keeps the tab open.
 ///
 /// That point is [`Tokens::is_expired_at`], `rhd`'s own renewal rule, not the
 /// token's bare expiry, so a session is never stored already due for renewal.
 ///
 /// A token Robinhood refused is remembered with what the read said and not sent
 /// again (one attempt, no loops), so a tab sitting on a dead session costs one read
-/// rather than one per poll, and the timeout names the cause. A read that cannot
-/// decide ends the wait and takes nothing: a throttle, Robinhood down, or an answer
-/// that is not the accounts list. The accepted page is kept: it is the session's proof
-/// ([`finish_window`]).
+/// rather than one per poll, and the timeout names the cause. Only a 401 or Robinhood's
+/// own JSON is a refusal ([`ReadFailure::definite_refusal`]). The accepted page is kept:
+/// it is the session's proof ([`finish_window`]).
+///
+/// A read that cannot decide takes the session unverified: a throttle, Robinhood down,
+/// a dropped connection, a bot check's page, or an answer that is not the accounts list.
+/// Site storage goes again once Chrome stops, so the page holds the only copy, and it
+/// can only be this sign-in's. A bad one costs one more sign-in, the same as discarding
+/// it, and a good one costs none. [`refuse_overwrite`] has already run, so it cannot
+/// replace a stored session without `--overwrite`.
 fn confirm_candidate(
     candidate: &pk_cli_browser::Captured,
     now: u64,
@@ -444,7 +513,7 @@ fn confirm_candidate(
         Ok(raw) => raw,
         Err(e) => return Confirm::NotYet(e.to_string()),
     };
-    let Captured { shape, tokens } = match capture::parse(raw.expose(), now, Source::Browser) {
+    let Captured { tokens, .. } = match capture::parse(raw.expose(), now, Source::Browser) {
         Ok(captured) => captured,
         Err(e) => return Confirm::NotYet(e.to_string()),
     };
@@ -465,17 +534,24 @@ fn confirm_candidate(
             *memory.accepted.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
             Confirm::Ready
         }
-        Ok(_) => Confirm::Fail(unproven(no_accounts_list(), shape, Source::Browser)),
-        Err(failure) if failure.is_auth() => {
-            let reason = failure.cause();
-            *refused = Some(Refused {
-                token: Secret::new(tokens.access_token.clone()),
-                reason: reason.clone(),
-            });
-            Confirm::NotYet(reason)
-        }
-        Err(failure) => Confirm::Fail(unproven(failure, shape, Source::Browser)),
+        Ok(_) => take_unverified(memory, no_accounts_list().cause()),
+        Err(failure) => match failure.definite_refusal() {
+            Some(reason) => {
+                *refused = Some(Refused {
+                    token: Secret::new(tokens.access_token.clone()),
+                    reason: reason.clone(),
+                });
+                Confirm::NotYet(reason)
+            }
+            None => take_unverified(memory, failure.inconclusive_cause()),
+        },
     }
+}
+
+/// End the wait with the session taken, remembering why it is unverified.
+fn take_unverified(memory: &WindowMemory, why: String) -> Confirm {
+    *memory.unverified.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    Confirm::Ready
 }
 
 /// The session a capture read, as `--session-stdin` would have it.
@@ -553,21 +629,55 @@ pub fn import_session(
     // wait on a busy lock, so bad input still fails at once; the store waits.
     RefreshLock::for_binary(config::BIN)?.try_hold(|| Ok(()))?;
     let raw = read_capture(common, non_interactive)?;
-    let proven = prove_import(&raw, Source::Stdin, prove_session)?;
+    let checked = prove_import(&raw, Source::Stdin, prove_session)?;
     let creds = CredentialStore::for_binary(config::BIN);
-    store_import(common, store, cfg, profile, proven, |tokens| {
+    store_import(common, store, cfg, profile, checked, |tokens| {
         store_session(&creds, profile, tokens)
     })
 }
 
-/// A session and its proof: **one** authenticated read, which for `--session-stdin`
-/// happens here and for `--browser` already has, in the confirm hook.
-struct ProvenImport {
+/// A session and what its **one** authenticated read said. For `--session-stdin` that
+/// read happens here and must prove it. For `--browser` it already has, in the confirm
+/// hook, and `unverified` says why it could not decide, if it could not.
+struct CheckedImport {
     source: Source,
     shape: capture::Shape,
     tokens: Tokens,
     visible: Vec<Value>,
     more: bool,
+    unverified: Option<String>,
+}
+
+impl CheckedImport {
+    fn report(&self, profile: &str) -> SessionImport {
+        SessionImport {
+            profile: profile.to_string(),
+            source: self.source,
+            shape: self.shape,
+            accounts_visible: self.visible.len(),
+            more_accounts: self.more,
+            renewable: self.tokens.refresh_token.is_some(),
+            expires_at: self.tokens.expires_at_rfc3339(),
+            device_token: self.tokens.device_token.is_some(),
+            read_only_token: self.tokens.read_only_token.is_some(),
+            verified: self.unverified.is_some().then_some(false),
+        }
+    }
+}
+
+/// A session from the window that its one read could not decide on: no page was read,
+/// so it holds no accounts.
+fn unverified_import(raw: &Secret, why: String) -> Result<CheckedImport, CliError> {
+    let Captured { shape, tokens } =
+        capture::parse(raw.expose(), crate::client::now_unix(), Source::Browser)?;
+    Ok(CheckedImport {
+        source: Source::Browser,
+        shape,
+        tokens,
+        visible: Vec::new(),
+        more: false,
+        unverified: Some(why),
+    })
 }
 
 /// Parse the session and take `read`'s answer as its proof.
@@ -575,18 +685,19 @@ fn prove_import(
     raw: &Secret,
     source: Source,
     read: impl FnOnce(&str) -> Result<Value, ReadFailure>,
-) -> Result<ProvenImport, CliError> {
+) -> Result<CheckedImport, CliError> {
     let Captured { shape, tokens } =
         capture::parse(raw.expose(), crate::client::now_unix(), source)?;
     let page = read(&tokens.access_token).map_err(|failure| unproven(failure, shape, source))?;
     let (visible, more) =
         accounts_page(&page).ok_or_else(|| unproven(no_accounts_list(), shape, source))?;
-    Ok(ProvenImport {
+    Ok(CheckedImport {
         source,
         shape,
         tokens,
         visible,
         more,
+        unverified: None,
     })
 }
 
@@ -599,39 +710,41 @@ fn store_import(
     store: &ConfigStore,
     mut cfg: Config,
     profile: &str,
-    proven: ProvenImport,
+    checked: CheckedImport,
     save: impl FnOnce(&Tokens) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
-    let ProvenImport {
-        source,
-        shape,
-        tokens,
-        visible,
-        more,
-    } = proven;
-    save(&tokens)?;
-    // A captured session names no username; the proving read was one page.
-    record_profile(store, &mut cfg, profile, None, &visible, !more)?;
+    save(&checked.tokens)?;
+    // A captured session names no username; the proving read was one page, and an
+    // unverified session read none, so the login is recorded with no account adopted.
+    record_profile(
+        store,
+        &mut cfg,
+        profile,
+        None,
+        &checked.visible,
+        !checked.more,
+    )?;
 
-    let report = SessionImport {
-        profile: profile.to_string(),
-        source,
-        shape,
-        accounts_visible: visible.len(),
-        more_accounts: more,
-        renewable: tokens.refresh_token.is_some(),
-        expires_at: tokens.expires_at_rfc3339(),
-        device_token: tokens.device_token.is_some(),
-        read_only_token: tokens.read_only_token.is_some(),
-    };
+    let report = checked.report(profile);
     if common.json {
         crate::commands::emit_one("session-import/v1", &report, true);
-    } else if !common.quiet {
-        for line in report.lines() {
-            eprintln!("{line}");
-        }
+    }
+    for note in report.notes(common, checked.unverified.as_deref()) {
+        eprintln!("{note}");
     }
     Ok(())
+}
+
+/// `auth status` makes no request, so it is not what tests the session. An answer such
+/// as an HTML 403 or an empty 2xx can repeat on every later read, and then only a new
+/// sign-in gets past it, so this names that way out.
+fn unverified_warning(why: &str, profile: &str) -> String {
+    format!(
+        "the sign-in is kept, but its session is stored unverified: {}. A later read, such as \
+         `rhd accounts list --profile {profile}`, may settle it; if reads keep failing, run \
+         `rhd auth login --browser --overwrite --profile {profile}`.",
+        why.trim_end_matches('.')
+    )
 }
 
 /// What `--browser` or `--session-stdin` stored, without a single token
@@ -643,7 +756,8 @@ struct SessionImport {
     source: Source,
     /// `web_auth_state` or `bearer` ([`capture::Shape`]'s serialization).
     shape: capture::Shape,
-    /// Accounts on the proving read's page.
+    /// Accounts on the proving read's page: 0 with `verified: false`, where no page
+    /// was read.
     accounts_visible: usize,
     /// The read was one page of several (the proof spends one request).
     more_accounts: bool,
@@ -656,9 +770,26 @@ struct SessionImport {
     device_token: bool,
     /// The session carries a read-only secondary token (stored, not used).
     read_only_token: bool,
+    /// `false` when the one read could not decide and the session was stored anyway.
+    /// Absent on a session a read proved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
 }
 
 impl SessionImport {
+    /// What goes to stderr. The warning comes under `-q` and `--json` too: nothing has
+    /// shown that session works.
+    fn notes(&self, common: &CommonArgs, unverified: Option<&str>) -> Vec<String> {
+        let mut notes: Vec<String> = unverified
+            .map(|why| format!("warning: {}", unverified_warning(why, &self.profile)))
+            .into_iter()
+            .collect();
+        if !common.json && !common.quiet {
+            notes.extend(self.lines());
+        }
+        notes
+    }
+
     fn lines(&self) -> Vec<String> {
         let shape = match self.shape {
             capture::Shape::WebAuthState => "web:auth_state",
@@ -669,16 +800,23 @@ impl SessionImport {
             Source::Browser => "stored the browser sign-in's session",
             Source::Stdin => "imported a browser session",
         };
-        let mut out = vec![format!(
-            "{what} ({shape}) into profile `{}` — {n}{} account{} visible",
-            self.profile,
-            if self.more_accounts { "+" } else { "" },
-            if n == 1 && !self.more_accounts {
-                ""
-            } else {
-                "s"
-            }
-        )];
+        let mut out = vec![if self.verified == Some(false) {
+            format!(
+                "{what} ({shape}) into profile `{}`, unverified, with no accounts read",
+                self.profile
+            )
+        } else {
+            format!(
+                "{what} ({shape}) into profile `{}` — {n}{} account{} visible",
+                self.profile,
+                if self.more_accounts { "+" } else { "" },
+                if n == 1 && !self.more_accounts {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        }];
         let until = match &self.expires_at {
             Some(at) => format!("until {at}"),
             None => "until Robinhood expires it (the token does not say when)".into(),
@@ -689,7 +827,7 @@ impl SessionImport {
             ));
             if !self.device_token {
                 let again = match self.source {
-                    Source::Browser => "sign in again with `rhd auth login --browser`",
+                    Source::Browser => "sign in again with `rhd auth login --browser --overwrite`",
                     Source::Stdin => {
                         "re-import with the Console snippet in `rhd auth login --help`"
                     }
@@ -1369,7 +1507,150 @@ mod tests {
             expires_at: Some("2026-11-03T00:00:00Z".into()),
             device_token: device,
             read_only_token: renewable,
+            verified: None,
         }
+    }
+
+    /// `verified: false` is additive: on a verified login the field is absent, and
+    /// nothing else in the result differs.
+    #[test]
+    fn the_result_says_verified_false_only_when_it_is_unverified() {
+        let proved =
+            serde_json::to_value(report(capture::Shape::WebAuthState, true, true)).unwrap();
+        assert!(proved.get("verified").is_none(), "{proved}");
+
+        let mut unproved = report(capture::Shape::WebAuthState, true, true);
+        unproved.verified = Some(false);
+        let mut unproved = serde_json::to_value(unproved).unwrap();
+        assert_eq!(unproved["verified"], json!(false), "{unproved}");
+        unproved.as_object_mut().unwrap().remove("verified");
+        assert_eq!(unproved, proved);
+    }
+
+    /// Each route's result, from what its read said.
+    #[test]
+    fn each_route_reports_what_its_read_said() {
+        let raw = Secret::new(
+            held(&token_until(FAR))
+                .value()
+                .unwrap()
+                .expose()
+                .to_string(),
+        );
+        let unverified = unverified_import(&raw, "dummy cause".into()).ok().unwrap();
+        let shape = unverified.report("dummy-one");
+        assert_eq!(shape.verified, Some(false));
+        assert_eq!(shape.accounts_visible, 0);
+        assert_eq!(unverified.unverified.as_deref(), Some("dummy cause"));
+
+        let proven = prove_import(&raw, Source::Stdin, |_| Ok(accepted_page()))
+            .ok()
+            .unwrap();
+        let shape = proven.report("dummy-one");
+        assert_eq!(shape.verified, None);
+        assert_eq!(shape.accounts_visible, 1);
+    }
+
+    /// The warning comes under `-q` and `--json`, and says why. The rest follows them.
+    #[test]
+    fn the_unverified_warning_prints_under_quiet_and_json() {
+        let mut result = report(capture::Shape::WebAuthState, true, true);
+        result.verified = Some(false);
+        for common in [
+            CommonArgs {
+                quiet: true,
+                ..CommonArgs::default()
+            },
+            CommonArgs {
+                json: true,
+                ..CommonArgs::default()
+            },
+        ] {
+            let notes = result.notes(&common, Some("dummy cause."));
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            let note = &notes[0];
+            assert!(note.starts_with("warning: "), "{note}");
+            assert!(note.contains("stored unverified: dummy cause."), "{note}");
+            assert!(
+                note.contains("`rhd accounts list --profile primary`"),
+                "{note}"
+            );
+            assert!(!note.contains("auth status"), "{note}");
+            assert!(
+                note.ends_with(
+                    "if reads keep failing, run `rhd auth login --browser --overwrite --profile \
+                     primary`."
+                ),
+                "{note}"
+            );
+        }
+        let loud = result.notes(&CommonArgs::default(), Some("dummy cause"));
+        assert!(loud[0].starts_with("warning: "), "{loud:?}");
+        assert!(
+            loud[1].contains("unverified, with no accounts read"),
+            "{loud:?}"
+        );
+
+        let proved = report(capture::Shape::WebAuthState, true, true);
+        let quiet = CommonArgs {
+            quiet: true,
+            ..CommonArgs::default()
+        };
+        assert!(proved.notes(&quiet, None).is_empty());
+    }
+
+    /// With a session stored and no `--overwrite`, the sign-in stops before Chrome. With
+    /// the flag the keychain is not even asked.
+    #[test]
+    fn a_stored_session_is_refused_without_overwrite() {
+        let err = refuse_overwrite("dummy-one", false, || Ok(true)).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(
+            err.to_string()
+                .contains("`rhd auth login --browser --overwrite --profile dummy-one`"),
+            "{err}"
+        );
+        refuse_overwrite("dummy-one", false, || Ok(false)).unwrap();
+        refuse_overwrite("dummy-one", true, || panic!("the flag says enough")).unwrap();
+        let locked = refuse_overwrite("dummy-one", false, || {
+            Err(CliError::Keychain("dummy".into()))
+        })
+        .unwrap_err();
+        assert_eq!(
+            locked.exit_code(),
+            CliError::Keychain("dummy".into()).exit_code()
+        );
+    }
+
+    /// Only an `RHD_CHROME` that names nothing skips the keychain check, and the crate
+    /// then ends the sign-in before any window.
+    #[test]
+    fn only_a_missing_named_chrome_skips_the_stored_session_check() {
+        assert!(!chrome_is_missing(None));
+        assert!(chrome_is_missing(Some(
+            "/nonexistent/rhd-test-chrome".into()
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let chrome = dir.path().join("chrome");
+        std::fs::write(&chrome, "").unwrap();
+        assert!(!chrome_is_missing(Some(chrome.into_os_string())));
+    }
+
+    /// A retry keeps the flags that got this far.
+    #[test]
+    fn the_retry_hint_keeps_the_flags() {
+        assert_eq!(
+            retry_hint("dummy-one", false, false),
+            "rhd auth login --browser --profile dummy-one"
+        );
+        assert_eq!(
+            retry_hint("dummy-one", false, true),
+            "rhd auth login --browser --overwrite --profile dummy-one"
+        );
+        assert_eq!(
+            retry_hint("dummy-one", true, true),
+            "rhd auth login --browser --overwrite --profile dummy-one --fresh-profile"
+        );
     }
 
     /// The import report is the owner's only view of what was stored, so
@@ -1433,6 +1714,7 @@ mod tests {
         let rejected = ReadFailure::Rejected {
             status: 401,
             detail: None,
+            json_body: true,
         };
         let msg = unproven(rejected, capture::Shape::WebAuthState, Source::Browser).to_string();
         assert!(
@@ -1601,17 +1883,20 @@ mod tests {
         }
     }
 
-    /// The hook against real answers: a throttle or an outage ends the wait
-    /// rather than loop on it, a refusal keeps the tab open, and only an accounts
-    /// list closes it. Neither of the first two is remembered as a refused token.
-    #[test]
-    fn a_read_that_cannot_decide_ends_the_wait_and_accepts_nothing() {
-        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
-        const URL: &str = "https://api.robinhood.com/accounts/";
-        let read = |status: u16, body: &str| crate::client::classify(status, URL, None, body);
-        let list = r#"{"results":[]}"#;
-        let token = token_until(NOW + 3600);
+    const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+    const URL: &str = "https://api.robinhood.com/accounts/";
 
+    /// The hook against answers that cannot decide: each ends the wait with the
+    /// session taken, on one read, and it is stored, with the login recorded and no
+    /// account adopted. None is remembered as a refused token.
+    #[test]
+    fn each_inconclusive_answer_stores_warns_and_reads_once() {
+        let token = token_until(FAR);
+        let list = r#"{"results":[]}"#;
+        let quiet = CommonArgs {
+            quiet: true,
+            ..CommonArgs::default()
+        };
         for (status, body) in [
             (429, PAGE),
             (429, "{}"),
@@ -1625,29 +1910,120 @@ mod tests {
             (200, "{}"),
             (200, "{nope"),
             (200, r#"{"results":null}"#),
+            (200, PAGE),
+            (403, PAGE),
+            (404, PAGE),
+            (404, "{}"),
+            (403, ""),
+            (403, "Forbidden"),
         ] {
             let memory = WindowMemory::default();
-            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(status, body));
-            match answer {
-                Confirm::Fail(e) => assert_eq!(e.exit_code(), 5, "{status} {body}: {e}"),
-                other => panic!("{status} {body} must end the wait: {other:?}"),
-            }
-            assert!(memory.refused.lock().unwrap().is_none(), "{status} {body}");
-        }
-
-        for (status, body) in [(401, "{}"), (403, "{}"), (403, PAGE), (200, PAGE)] {
-            let memory = WindowMemory::default();
-            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(status, body));
+            let reads = std::cell::Cell::new(0);
+            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| {
+                reads.set(reads.get() + 1);
+                crate::client::classify(status, URL, None, body)
+            });
             assert!(
-                matches!(answer, Confirm::NotYet(_)),
+                matches!(answer, Confirm::Ready),
                 "{status} {body}: {answer:?}"
             );
-            assert!(memory.refused.lock().unwrap().is_some(), "{status} {body}");
-        }
+            assert!(memory.refused.lock().unwrap().is_none(), "{status} {body}");
+            assert!(memory.accepted.lock().unwrap().is_none(), "{status} {body}");
+            let why = memory.unverified.lock().unwrap().clone().unwrap();
+            let warning = unverified_warning(&why, "dummy-one");
+            assert!(
+                warning.contains("`rhd auth login --browser --overwrite --profile dummy-one`"),
+                "{warning}"
+            );
 
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+            let mut saved = None;
+            through_the_window(
+                "dummy-one",
+                false,
+                || Ok(held(&token)),
+                |raw| {
+                    finish_window(
+                        &quiet,
+                        &store,
+                        Config::default(),
+                        "dummy-one",
+                        &raw,
+                        &memory,
+                        |tokens| {
+                            saved = Some(tokens.access_token.clone());
+                            Ok(())
+                        },
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(reads.get(), 1, "{status} {body}");
+            assert_eq!(saved.as_deref(), Some(token.as_str()), "{status} {body}");
+            let cfg: Config = store.load().unwrap();
+            assert!(
+                cfg.profiles["dummy-one"].account.is_none(),
+                "{status} {body}"
+            );
+            assert_eq!(cfg.default_profile.as_deref(), Some("dummy-one"));
+        }
+    }
+
+    /// The hook against a definite refusal: a 401, or Robinhood's own JSON. The tab
+    /// stays open, the token is not sent again, and nothing is stored unless a new
+    /// sign-in replaces it.
+    #[test]
+    fn a_definite_refusal_keeps_waiting_and_stores_nothing() {
+        let token = token_until(NOW + 3600);
+        for (status, body) in [
+            (401, "{}"),
+            (401, ""),
+            (401, "Unauthorized"),
+            (401, PAGE),
+            (403, "{}"),
+            (403, r#"{"detail":"dummy refusal"}"#),
+        ] {
+            let memory = WindowMemory::default();
+            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| {
+                crate::client::classify(status, URL, None, body)
+            });
+            let reason = match answer {
+                Confirm::NotYet(reason) => reason,
+                other => panic!("{status} {body} must keep waiting: {other:?}"),
+            };
+            assert!(reason.contains(&format!("HTTP {status}")), "{reason}");
+            assert!(memory.refused.lock().unwrap().is_some(), "{status} {body}");
+            assert!(
+                memory.unverified.lock().unwrap().is_none(),
+                "{status} {body}"
+            );
+            let again = confirm_candidate(&held(&token), NOW, &memory, |_| {
+                panic!("{status} {body}: the refused token was sent again")
+            });
+            assert!(matches!(again, Confirm::NotYet(_)), "{again:?}");
+
+            through_the_window(
+                "dummy-one",
+                false,
+                || Err(BrowserError::TimedOut(reason)),
+                |_| panic!("{status} {body}: nothing is stored"),
+            )
+            .unwrap_err();
+        }
+    }
+
+    /// An accounts list is the only answer that closes the tab verified.
+    #[test]
+    fn only_an_accounts_list_is_verified() {
         let memory = WindowMemory::default();
-        let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(200, list));
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &memory, |_| {
+            crate::client::classify(200, URL, None, r#"{"results":[]}"#)
+        });
         assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+        assert!(memory.unverified.lock().unwrap().is_none());
+        assert!(memory.accepted.lock().unwrap().is_some());
     }
 
     const NOW: u64 = 1_800_000_000;
@@ -1717,6 +2093,7 @@ mod tests {
                 Err(ReadFailure::Rejected {
                     status: 401,
                     detail: None,
+                    json_body: true,
                 })
             });
             match answer {
@@ -1734,16 +2111,19 @@ mod tests {
         assert_eq!(reads.get(), 2);
     }
 
+    /// A dropped connection says nothing about the session.
     #[test]
-    fn a_failure_waiting_will_not_fix_ends_the_wait() {
+    fn a_dropped_connection_keeps_the_sign_in() {
         let memory = WindowMemory::default();
         let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &memory, |_| {
-            Err(ReadFailure::Throttled { retry_after: None })
+            Err(ReadFailure::Upstream("dummy dropped connection".into()))
         });
-        match answer {
-            Confirm::Fail(e) => assert_eq!(e.exit_code(), 5),
-            other => panic!("must end the wait: {other:?}"),
-        }
+        assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+        assert!(memory.refused.lock().unwrap().is_none());
+        assert_eq!(
+            memory.unverified.lock().unwrap().as_deref(),
+            Some("dummy dropped connection")
+        );
     }
 
     #[test]
@@ -1794,7 +2174,7 @@ mod tests {
         name: &str,
         fresh: bool,
     ) -> Result<pk_cli_browser::Browser, BrowserError> {
-        browser_launch(name, fresh, true)
+        browser_launch(name, fresh, false, true)
             .unwrap()
             .profile_root(root)
             .chrome(chrome)
@@ -1971,12 +2351,12 @@ mod tests {
     #[test]
     fn a_name_no_browser_profile_can_carry_is_refused_not_mapped() {
         for name in ["has.dot", "has space", "a/b", "", &"a".repeat(65)] {
-            let err = browser_launch(name, false, true).unwrap_err();
+            let err = browser_launch(name, false, false, true).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{name:?}: {err}");
             let msg = err.to_string();
             assert!(msg.contains("1 to 64"), "{msg}");
             assert!(msg.contains("--fresh-profile"), "{msg}");
-            assert!(browser_launch(name, true, true).is_ok(), "{name:?}");
+            assert!(browser_launch(name, true, false, true).is_ok(), "{name:?}");
         }
     }
 
@@ -2167,29 +2547,39 @@ mod tests {
         .err()
         .expect("a failed read proves nothing");
         assert_eq!(err.exit_code(), 5, "{err}");
-        let proven = prove_import(&raw, Source::Stdin, |_| Ok(accepted_page()))
+        for failure in [
+            ReadFailure::Html {
+                status: 403,
+                url: "https://example.invalid/accounts/".into(),
+            },
+            ReadFailure::Upstream("dummy outage".into()),
+        ] {
+            assert!(prove_import(&raw, Source::Stdin, |_| Err(failure)).is_err());
+        }
+        let checked = prove_import(&raw, Source::Stdin, |_| Ok(accepted_page()))
             .ok()
             .unwrap();
-        assert_eq!(proven.visible.len(), 1);
+        assert_eq!(checked.visible.len(), 1);
     }
 
-    /// A bot check on the hook's read names itself, on every poll, so the timeout
-    /// does not call a signed-in tab a dead session.
+    /// A bot check's page on the hook's read names itself in the warning, with nothing
+    /// that calls a session this window just made a dead one.
     #[test]
-    fn a_403_html_answer_keeps_its_reason() {
-        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
-        let memory = WindowMemory::default();
+    fn an_html_answer_warns_that_it_was_a_bot_check() {
         let token = token_until(NOW + 3600);
-        for _ in 0..2 {
+        for status in [200, 403] {
+            let memory = WindowMemory::default();
             let answer = confirm_candidate(&held(&token), NOW, &memory, |_| {
-                crate::client::classify(403, "https://example.invalid/accounts/", None, PAGE)
+                crate::client::classify(status, URL, None, PAGE)
             });
-            match answer {
-                Confirm::NotYet(reason) => {
-                    assert!(reason.contains("HTTP 403"), "{reason}");
-                    assert!(reason.contains("bot check"), "{reason}");
-                }
-                other => panic!("must keep waiting: {other:?}"),
+            assert!(matches!(answer, Confirm::Ready), "{status}: {answer:?}");
+            let why = memory.unverified.lock().unwrap().take().unwrap();
+            let warning = unverified_warning(&why, "dummy-one");
+            assert!(warning.contains(&format!("HTTP {status}")), "{warning}");
+            assert!(warning.contains("bot check"), "{warning}");
+            assert!(warning.contains("stored unverified"), "{warning}");
+            for dead in ["refused", "lapsed", "expired", "dead", "nothing was stored"] {
+                assert!(!warning.contains(dead), "{dead}: {warning}");
             }
         }
     }
@@ -2563,6 +2953,7 @@ mod tests {
         let rejected = ReadFailure::Rejected {
             status: 401,
             detail: Some("Incorrect authentication credentials.".into()),
+            json_body: true,
         };
         let err = unproven(rejected, capture::Shape::Bearer, Source::Stdin);
         assert_eq!(err.exit_code(), 3);

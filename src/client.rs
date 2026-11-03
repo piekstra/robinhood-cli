@@ -217,7 +217,8 @@ impl Tokens {
     pub fn from_json(raw: &str) -> Result<Self, CliError> {
         serde_json::from_str(raw).map_err(|e| {
             CliError::Auth(format!(
-                "the cached session could not be read ({e}) — run `rhd auth login --browser` again"
+                "the cached session could not be read ({e}) — run `rhd auth login --browser \
+                 --overwrite` again"
             ))
         })
     }
@@ -613,7 +614,7 @@ impl Rh {
         if v.get("verification_workflow").is_some() {
             return Err(CliError::Auth(
                 "the stored session can no longer be refreshed (Robinhood wants device \
-                 approval again) — run `rhd auth login --browser`"
+                 approval again) — run `rhd auth login --browser --overwrite`"
                     .into(),
             ));
         }
@@ -911,7 +912,8 @@ impl Rh {
         }
         if status == 401 || status == 403 {
             return Err(CliError::Auth(format!(
-                "Robinhood refused the document download (HTTP {status}) — run `rhd auth login --browser`"
+                "Robinhood refused the document download (HTTP {status}) — run `rhd auth login \
+                 --browser --overwrite`"
             )));
         }
         if status == 404 {
@@ -991,8 +993,13 @@ pub fn same_origin_of(base: &str, url: &str) -> bool {
 #[derive(Debug)]
 pub enum ReadFailure {
     /// 401/403: the provider refused the token. `detail` is the provider's
-    /// own message, when it gave one.
-    Rejected { status: u16, detail: Option<String> },
+    /// own message, when it gave one. `json_body` says whether the body was JSON:
+    /// a bare 403 can come from an edge in front of the provider.
+    Rejected {
+        status: u16,
+        detail: Option<String>,
+        json_body: bool,
+    },
     /// HTML where JSON was expected — how a bounced session usually answers,
     /// often with a 200.
     Html { status: u16, url: String },
@@ -1014,10 +1021,43 @@ impl ReadFailure {
         )
     }
 
+    /// What the answer says, if it refuses the token for certain: a 401, or
+    /// Robinhood's own JSON on a 403. An HTML page or a bare 403 can come from an edge
+    /// in front of Robinhood, so it says nothing certain about the token, though an
+    /// ordinary read treats it as [`is_auth`](Self::is_auth).
+    pub fn definite_refusal(&self) -> Option<String> {
+        match self {
+            ReadFailure::Rejected {
+                status, json_body, ..
+            } if *status == 401 || *json_body => Some(self.cause()),
+            ReadFailure::Html { status: 401, .. } => {
+                Some("Robinhood rejected the request (HTTP 401)".into())
+            }
+            _ => None,
+        }
+    }
+
+    /// What an answer that is no [`definite_refusal`](Self::definite_refusal) said,
+    /// for a session stored unverified. Unlike [`cause`](Self::cause), it does not
+    /// suggest the session has lapsed: this one was written moments ago.
+    pub fn inconclusive_cause(&self) -> String {
+        match self {
+            ReadFailure::Html { status, url } => format!(
+                "{url} answered with an HTML page (HTTP {status}), most likely a bot check and \
+                 no verdict on the session"
+            ),
+            ReadFailure::Rejected { status, .. } => format!(
+                "Robinhood's accounts read answered HTTP {status} with no JSON, most likely a \
+                 block at the edge and no verdict on the session"
+            ),
+            other => other.cause(),
+        }
+    }
+
     /// What went wrong, with no remediation attached.
     pub fn cause(&self) -> String {
         match self {
-            ReadFailure::Rejected { status, detail } => format!(
+            ReadFailure::Rejected { status, detail, .. } => format!(
                 "Robinhood rejected the request (HTTP {status}){}",
                 detail
                     .as_deref()
@@ -1039,12 +1079,12 @@ impl ReadFailure {
     pub fn into_cli_error(self) -> CliError {
         let cause = self.cause();
         match self {
-            ReadFailure::Rejected { .. } => {
-                CliError::Auth(format!("{cause} — run `rhd auth login --browser`"))
-            }
-            ReadFailure::Html { .. } => {
-                CliError::Auth(format!("{cause}; run `rhd auth login --browser`"))
-            }
+            ReadFailure::Rejected { .. } => CliError::Auth(format!(
+                "{cause} — run `rhd auth login --browser --overwrite`"
+            )),
+            ReadFailure::Html { .. } => CliError::Auth(format!(
+                "{cause}; run `rhd auth login --browser --overwrite`"
+            )),
             ReadFailure::NotFound { .. } => CliError::NotFound(cause),
             ReadFailure::Throttled { .. } | ReadFailure::Upstream(_) => CliError::Upstream(cause),
         }
@@ -1102,6 +1142,7 @@ pub(crate) fn classify(
         return Err(ReadFailure::Rejected {
             status,
             detail: provider_detail(&body()).map(str::to_string),
+            json_body: serde_json::from_str::<Value>(text).is_ok(),
         });
     }
     if status == 404 {
@@ -1146,7 +1187,8 @@ fn throttled_message(retry_after: Option<&str>) -> String {
 fn parse_json(text: &str, status: u16) -> Result<Value, CliError> {
     if looks_like_html(text) {
         return Err(CliError::Auth(format!(
-            "expected JSON but got an HTML page (HTTP {status}) — run `rhd auth login --browser`"
+            "expected JSON but got an HTML page (HTTP {status}) — run `rhd auth login --browser \
+             --overwrite`"
         )));
     }
     if text.trim().is_empty() {
@@ -1667,7 +1709,8 @@ mod tests {
         let err = rejected.into_cli_error();
         assert_eq!(err.exit_code(), 3);
         assert!(
-            err.to_string().contains("run `rhd auth login --browser`"),
+            err.to_string()
+                .contains("run `rhd auth login --browser --overwrite`"),
             "{err}"
         );
 
@@ -1689,7 +1732,8 @@ mod tests {
         assert_eq!(down.into_cli_error().exit_code(), 5);
 
         // A throttle or an outage is no verdict on the session, whatever its
-        // body. HTML on any other status still reads as a refusal.
+        // body. On an ordinary read, HTML on any other status still reads as a
+        // refusal.
         const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
         let throttled = classify(429, url, Some("51".into()), PAGE).unwrap_err();
         assert!(matches!(throttled, ReadFailure::Throttled { .. }));
@@ -1706,6 +1750,35 @@ mod tests {
         );
         assert_eq!(classify(200, url, None, "").unwrap(), Value::Null);
         assert!(!classify(200, url, None, "{nope").unwrap_err().is_auth());
+    }
+
+    /// Only a 401 or Robinhood's own JSON refuses a token for certain. What an ordinary
+    /// read takes as an auth failure can still be no verdict.
+    #[test]
+    fn only_a_401_or_the_providers_json_is_a_definite_refusal() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let url = "https://api.robinhood.com/accounts/";
+        for (status, body) in [
+            (401, "{}"),
+            (401, ""),
+            (401, "Unauthorized"),
+            (401, PAGE),
+            (403, "{}"),
+            (403, r#"{"detail":"dummy refusal"}"#),
+        ] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(failure.is_auth(), "{status} {body}");
+            assert!(failure.definite_refusal().is_some(), "{status} {body}");
+        }
+        for (status, body) in [(200, PAGE), (403, PAGE), (403, ""), (403, "Forbidden")] {
+            let failure = classify(status, url, None, body).unwrap_err();
+            assert!(failure.is_auth(), "{status} {body}");
+            assert_eq!(failure.definite_refusal(), None, "{status} {body}");
+            let why = failure.inconclusive_cause();
+            assert!(why.contains(&format!("HTTP {status}")), "{why}");
+            assert!(why.contains("no verdict"), "{why}");
+            assert!(!why.contains("lapsed"), "{why}");
+        }
     }
 
     /// The pacing rail: two back-to-back calls must be spaced, or a paginated
