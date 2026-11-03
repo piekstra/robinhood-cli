@@ -1025,8 +1025,8 @@ impl ReadFailure {
                     .unwrap_or_default()
             ),
             ReadFailure::Html { status, url } => format!(
-                "expected JSON from {url} but got an HTML page (HTTP {status}) — the session has \
-                 probably lapsed"
+                "expected JSON from {url} but got an HTML page (HTTP {status}) — a bot check \
+                 intervened or the session has lapsed"
             ),
             ReadFailure::Throttled { retry_after } => throttled_message(retry_after.as_deref()),
             ReadFailure::NotFound { url } => format!("HTTP 404 from {url}"),

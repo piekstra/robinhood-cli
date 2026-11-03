@@ -27,7 +27,9 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
   another user's, that is exit 1. The config entry goes last, only once the rest is
   clear, so the retry can find the login. A config file that cannot be parsed stops no
   step when `--profile` or `RHD_PROFILE` names the login; without a name logout asks
-  for one.
+  for one. A named login the config does not know now runs every step too and says so,
+  where it used to be exit 4, so what a failed first sign-in left can be removed. Reads
+  of that name stay refused.
 - Every failure once the window has opened now says the kept profile stays and that
   `rhd auth logout` removes it: a timeout, a closed window, Ctrl-C, Robinhood
   throttled or down during the check, a keychain write that fails.
@@ -43,7 +45,14 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
   stopped; after a crash or a second Ctrl-C, the next launch removes it. Its cookies
   stay, and Chrome now quits over its debug port, so a fresh one reaches the disk.
 - The capture now takes a session only once it is short of `rhd`'s renewal point and
-  Robinhood accepts it. A token Robinhood refused is not sent again. A throttle or an
-  outage during that check ends the wait with an error.
+  Robinhood accepts it. That is its one read: the accounts page it got is the proof, and
+  the session goes straight to the keychain. A token Robinhood refused is not sent
+  again, and a timeout says what the read answered, so a bot check names itself. A
+  throttle or an outage during that check ends the wait with an error.
+- Before going back to an older release, run `rhd auth logout --profile <NAME>` for each
+  login. An older release does not know the kept profiles and its logout leaves them
+  behind; otherwise delete
+  `~/Library/Application Support/piekstra.rhd/browser-profile-*` (on Linux, under
+  `$XDG_DATA_HOME` or `~/.local/share`) by hand afterwards.
 - A 429 or a 5xx with an HTML body is now exit 5, like any other 429 or 5xx, and no
   longer reads as a refused session (exit 3) on any command.

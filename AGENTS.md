@@ -236,10 +236,12 @@ and a rate-limited one.
   failure does not leave the profile behind, and the error says what is cleared and
   what remains, built from the inner messages, with the first failure's exit code
   (`TeardownSteps`). The config entry is the one exception: it goes last, only once
-  the rest is clear, because `Config::require_profile` refuses an unconfigured name
-  and the retry must find it. `auth logout` loads the config itself (`auth_logout`):
-  one that cannot be parsed stops no step when `--profile` or `RHD_PROFILE` names the
-  login, and without a name it refuses rather than guess.
+  the rest is clear, because `profiles remove` and a logout that names no login find
+  it there. `auth logout` loads the config itself (`auth_logout`, `logout_target`): a
+  name from `--profile` or `RHD_PROFILE` runs every step whether the config cannot be
+  parsed or does not know it, since a failed first sign-in leaves a profile under such
+  a name, and without a name it refuses rather than guess. Reads stay strict
+  (`Config::require_profile`).
   `--session-stdin` is the fallback (a session copied out of DevTools), and
   goes through the same parser, proof and keychain item. Either bundle
   carries its own `origin` and the browser's `device_token`, and renews with

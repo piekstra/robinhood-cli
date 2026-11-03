@@ -136,6 +136,16 @@ goes last, only once the rest is clear, so the retry can find the login. The bro
 profile is refused while a sign-in or a Chrome is using it, or when the path is a
 symlink or another user's; on its own that is exit 1.
 
+A logout that names a login with `--profile` or `RHD_PROFILE` runs every step even if
+the config does not know that name and says so, because a failed first sign-in leaves
+a kept profile under a name the config never recorded. Reads of that name stay
+refused.
+
+A release before 0.5.0 does not know the kept profiles, and its `auth logout` leaves
+them behind. Run `rhd auth logout --profile <NAME>` for each login before downgrading,
+or delete `~/Library/Application Support/piekstra.rhd/browser-profile-*` (on Linux,
+under `$XDG_DATA_HOME` or `~/.local/share`) by hand afterwards.
+
 ## The kept browser profile
 
 `auth login --browser` runs Chrome in a profile of its own, so nothing of your

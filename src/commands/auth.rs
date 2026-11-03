@@ -28,7 +28,7 @@
 //!   removes it ([`finish_logout`]), after a failed sign-in too
 //!   ([`through_the_window`]).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
@@ -289,26 +289,69 @@ pub fn browser_login(
     let launch = browser_launch(profile, fresh_profile, common.quiet)?;
     // Before the window: a sign-in the owner has finished is not thrown away.
     RefreshLock::for_binary(config::BIN)?.before_signin()?;
-    let refused = Mutex::new(None);
+    let memory = Arc::new(WindowMemory::default());
+    let hook_memory = Arc::clone(&memory);
     let capture = capture::browser_capture()?.confirm(move |candidate| {
         confirm_candidate(
             candidate,
             crate::client::now_unix(),
-            &refused,
+            &hook_memory,
             prove_session,
         )
     });
+    let creds = CredentialStore::for_binary(config::BIN);
     through_the_window(
         profile,
         fresh_profile,
         || pk_cli_browser::capture(launch, &capture, pk_cli_browser::DEFAULT_TIMEOUT),
-        |raw| import(common, store, cfg, profile, &raw, Source::Browser),
+        |raw| {
+            finish_window(common, store, cfg, profile, &raw, &memory, |tokens| {
+                store_session(&creds, profile, tokens)
+            })
+        },
     )
+}
+
+/// What the confirm hook remembers across polls: the token Robinhood refused, and
+/// the accounts page it accepted, which is the session's proof.
+#[derive(Default)]
+struct WindowMemory {
+    refused: Mutex<Option<Refused>>,
+    accepted: Mutex<Option<Value>>,
+}
+
+/// A token Robinhood refused, and what the read said.
+struct Refused {
+    token: Secret,
+    reason: String,
+}
+
+/// The window route's end. The page the hook accepted is the proof, so nothing is
+/// read here: by now Chrome has stopped and site storage is gone, and a throttle or a
+/// dropped connection on another read would throw a finished sign-in away.
+fn finish_window(
+    common: &CommonArgs,
+    store: &ConfigStore,
+    cfg: Config,
+    profile: &str,
+    raw: &Secret,
+    memory: &WindowMemory,
+    save: impl FnOnce(&Tokens) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let page = memory
+        .accepted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let proven = prove_import(raw, Source::Browser, |_| {
+        page.ok_or_else(|| ReadFailure::Upstream("the confirm hook kept no accounts page".into()))
+    })?;
+    store_import(common, store, cfg, profile, proven, save)
 }
 
 /// A browser sign-in from the window on, with every way it can fail in one
 /// place, so a new one cannot miss [`failed_sign_in`]: the window's own ending,
-/// the confirm hook's, the read after it and the keychain write.
+/// the confirm hook's and the keychain write.
 ///
 /// Only four failures skip the note, because they end the sign-in before this
 /// Chrome uses the profile: no Chrome, which points at the DevTools fallback
@@ -385,18 +428,18 @@ fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Lau
 /// That point is [`Tokens::is_expired_at`], `rhd`'s own renewal rule, not the
 /// token's bare expiry, so a session is never stored already due for renewal.
 ///
-/// A token Robinhood refused is remembered and not sent again (one attempt, no
-/// loops), so a tab sitting on a dead session costs one read rather than one
-/// per poll. A read that cannot decide ends the wait and takes nothing: a
-/// throttle, Robinhood down, or an answer that is not the accounts list.
+/// A token Robinhood refused is remembered with what the read said and not sent
+/// again (one attempt, no loops), so a tab sitting on a dead session costs one read
+/// rather than one per poll, and the timeout names the cause. A read that cannot
+/// decide ends the wait and takes nothing: a throttle, Robinhood down, or an answer
+/// that is not the accounts list. The accepted page is kept: it is the session's proof
+/// ([`finish_window`]).
 fn confirm_candidate(
     candidate: &pk_cli_browser::Captured,
     now: u64,
-    refused: &Mutex<Option<Secret>>,
+    memory: &WindowMemory,
     prove: impl FnOnce(&str) -> Result<Value, ReadFailure>,
 ) -> Confirm {
-    const DEAD: &str =
-        "Robinhood refused the session this window holds, and no new sign-in has finished";
     let raw = match session_text(candidate) {
         Ok(raw) => raw,
         Err(e) => return Confirm::NotYet(e.to_string()),
@@ -410,19 +453,26 @@ fn confirm_candidate(
             "the session this window holds has expired, and no new sign-in has finished".into(),
         );
     }
-    let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
-    if refused
+    let mut refused = memory.refused.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(earlier) = refused
         .as_ref()
-        .is_some_and(|token| token.expose() == tokens.access_token)
+        .filter(|earlier| earlier.token.expose() == tokens.access_token)
     {
-        return Confirm::NotYet(DEAD.into());
+        return Confirm::NotYet(earlier.reason.clone());
     }
     match prove(&tokens.access_token) {
-        Ok(page) if accounts_page(&page).is_some() => Confirm::Ready,
+        Ok(page) if accounts_page(&page).is_some() => {
+            *memory.accepted.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
+            Confirm::Ready
+        }
         Ok(_) => Confirm::Fail(unproven(no_accounts_list(), shape, Source::Browser)),
         Err(failure) if failure.is_auth() => {
-            *refused = Some(Secret::new(tokens.access_token.clone()));
-            Confirm::NotYet(DEAD.into())
+            let reason = failure.cause();
+            *refused = Some(Refused {
+                token: Secret::new(tokens.access_token.clone()),
+                reason: reason.clone(),
+            });
+            Confirm::NotYet(reason)
         }
         Err(failure) => Confirm::Fail(unproven(failure, shape, Source::Browser)),
     }
@@ -503,33 +553,63 @@ pub fn import_session(
     // wait on a busy lock, so bad input still fails at once; the store waits.
     RefreshLock::for_binary(config::BIN)?.try_hold(|| Ok(()))?;
     let raw = read_capture(common, non_interactive)?;
-    import(common, store, cfg, profile, &raw, Source::Stdin)
+    let proven = prove_import(&raw, Source::Stdin, prove_session)?;
+    let creds = CredentialStore::for_binary(config::BIN);
+    store_import(common, store, cfg, profile, proven, |tokens| {
+        store_session(&creds, profile, tokens)
+    })
 }
 
-/// The import both `--browser` and `--session-stdin` end in: parse, then
-/// prove with **one** authenticated read, then store exactly where a
+/// A session and its proof: **one** authenticated read, which for `--session-stdin`
+/// happens here and for `--browser` already has, in the confirm hook.
+struct ProvenImport {
+    source: Source,
+    shape: capture::Shape,
+    tokens: Tokens,
+    visible: Vec<Value>,
+    more: bool,
+}
+
+/// Parse the session and take `read`'s answer as its proof.
+fn prove_import(
+    raw: &Secret,
+    source: Source,
+    read: impl FnOnce(&str) -> Result<Value, ReadFailure>,
+) -> Result<ProvenImport, CliError> {
+    let Captured { shape, tokens } =
+        capture::parse(raw.expose(), crate::client::now_unix(), source)?;
+    let page = read(&tokens.access_token).map_err(|failure| unproven(failure, shape, source))?;
+    let (visible, more) =
+        accounts_page(&page).ok_or_else(|| unproven(no_accounts_list(), shape, source))?;
+    Ok(ProvenImport {
+        source,
+        shape,
+        tokens,
+        visible,
+        more,
+    })
+}
+
+/// The store both `--browser` and `--session-stdin` end in: exactly where a
 /// password login stores its bundle, so every command and the refresh path
 /// use it unchanged. The profile's own device token is left alone — the
-/// session carries the browser's.
-fn import(
+/// session carries the browser's. `save` is the keychain write.
+fn store_import(
     common: &CommonArgs,
     store: &ConfigStore,
     mut cfg: Config,
     profile: &str,
-    raw: &Secret,
-    source: Source,
+    proven: ProvenImport,
+    save: impl FnOnce(&Tokens) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
-    let Captured { shape, tokens } =
-        capture::parse(raw.expose(), crate::client::now_unix(), source)?;
-
-    let rh = Rh::new()?;
-    let page = read_accounts(&rh, &tokens.access_token)
-        .map_err(|failure| unproven(failure, shape, source))?;
-    let (visible, more) =
-        accounts_page(&page).ok_or_else(|| unproven(no_accounts_list(), shape, source))?;
-
-    let creds = CredentialStore::for_binary(config::BIN);
-    store_session(&creds, profile, &tokens)?;
+    let ProvenImport {
+        source,
+        shape,
+        tokens,
+        visible,
+        more,
+    } = proven;
+    save(&tokens)?;
     // A captured session names no username; the proving read was one page.
     record_profile(store, &mut cfg, profile, None, &visible, !more)?;
 
@@ -801,6 +881,46 @@ pub(crate) fn delete_item(
     }
 }
 
+/// Which login `auth logout` is for. A name from `--profile` or `$RHD_PROFILE` is
+/// taken as given: every step but the config entry needs only the name, a config that
+/// cannot be parsed must not stop them, and a failed first sign-in leaves a kept
+/// profile under a name the config never recorded, which nothing else can reach. Reads
+/// stay strict ([`Config::require_profile`]). Without a name the answer is in the
+/// config, and this does not guess: the default name could log out the wrong login, or
+/// none, and say it had.
+///
+/// The name only ever becomes keychain accounts and the crate's profile lookup, which
+/// refuses anything but 1 to 64 ASCII letters, digits, `-` or `_`, so it cannot leave
+/// the data directory.
+pub(crate) fn logout_target(
+    cfg: &Result<Config, CliError>,
+    flag: Option<&str>,
+) -> Result<String, CliError> {
+    if let Some(named) = config::named_profile(flag) {
+        return Ok(named);
+    }
+    match cfg {
+        Ok(cfg) => cfg.require_profile(None),
+        Err(e) => Err(CliError::Other(format!(
+            "{e}. That file says which login to log out, so nothing is cleared yet: name it \
+             with `rhd auth logout --profile <NAME>`"
+        ))),
+    }
+}
+
+/// Said after logging out a name the config does not know, so a mistyped name does not
+/// read as having logged the real login out.
+fn unconfigured_note(cfg: &Result<Config, CliError>, profile: &str) -> Option<String> {
+    let cfg = cfg.as_ref().ok()?;
+    (!cfg.profiles.is_empty() && !cfg.profiles.contains_key(profile)).then(|| {
+        format!(
+            "note: `{profile}` is not a configured login (known: {}); this cleared only what \
+             was stored under that name",
+            cfg.profile_names()
+        )
+    })
+}
+
 pub fn logout(
     common: &CommonArgs,
     store: &ConfigStore,
@@ -809,6 +929,7 @@ pub fn logout(
     forget: bool,
 ) -> Result<(), CliError> {
     let creds = CredentialStore::for_binary(config::BIN);
+    let note = unconfigured_note(&cfg, profile);
     let browser = finish_logout(
         store,
         cfg,
@@ -820,6 +941,9 @@ pub fn logout(
 
     if !common.quiet {
         eprintln!("{}", logged_out(profile, forget, browser));
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
     }
     Ok(())
 }
@@ -1502,27 +1626,27 @@ mod tests {
             (200, "{nope"),
             (200, r#"{"results":null}"#),
         ] {
-            let refused = Mutex::new(None);
-            let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(status, body));
+            let memory = WindowMemory::default();
+            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(status, body));
             match answer {
                 Confirm::Fail(e) => assert_eq!(e.exit_code(), 5, "{status} {body}: {e}"),
                 other => panic!("{status} {body} must end the wait: {other:?}"),
             }
-            assert!(refused.lock().unwrap().is_none(), "{status} {body}");
+            assert!(memory.refused.lock().unwrap().is_none(), "{status} {body}");
         }
 
         for (status, body) in [(401, "{}"), (403, "{}"), (403, PAGE), (200, PAGE)] {
-            let refused = Mutex::new(None);
-            let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(status, body));
+            let memory = WindowMemory::default();
+            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(status, body));
             assert!(
                 matches!(answer, Confirm::NotYet(_)),
                 "{status} {body}: {answer:?}"
             );
-            assert!(refused.lock().unwrap().is_some(), "{status} {body}");
+            assert!(memory.refused.lock().unwrap().is_some(), "{status} {body}");
         }
 
-        let refused = Mutex::new(None);
-        let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(200, list));
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token), NOW, &memory, |_| read(200, list));
         assert!(matches!(answer, Confirm::Ready), "{answer:?}");
     }
 
@@ -1548,8 +1672,8 @@ mod tests {
     /// read.
     #[test]
     fn an_expired_session_in_the_kept_profile_keeps_the_tab_open() {
-        let refused = Mutex::new(None);
-        let answer = confirm_candidate(&held(&token_until(NOW - 1)), NOW, &refused, |_| {
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token_until(NOW - 1)), NOW, &memory, |_| {
             panic!("an expired session must not reach Robinhood")
         });
         match answer {
@@ -1562,8 +1686,8 @@ mod tests {
     /// token is never read, let alone taken.
     #[test]
     fn a_token_due_for_renewal_is_not_taken() {
-        let refused = Mutex::new(None);
-        let answer = confirm_candidate(&held(&token_until(NOW + 60)), NOW, &refused, |_| {
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token_until(NOW + 60)), NOW, &memory, |_| {
             panic!("a token inside the renewal window must not reach Robinhood")
         });
         assert!(matches!(answer, Confirm::NotYet(_)), "{answer:?}");
@@ -1571,8 +1695,8 @@ mod tests {
 
     #[test]
     fn a_session_robinhood_accepts_closes_the_tab() {
-        let refused = Mutex::new(None);
-        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &refused, |_| {
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &memory, |_| {
             Ok(json!({ "results": [] }))
         });
         assert!(matches!(answer, Confirm::Ready), "{answer:?}");
@@ -1585,10 +1709,10 @@ mod tests {
     fn a_refused_session_waits_and_is_not_sent_again() {
         use std::cell::Cell;
         let reads = Cell::new(0);
-        let refused = Mutex::new(None);
+        let memory = WindowMemory::default();
         let dead = token_until(NOW + 3600);
         for _ in 0..3 {
-            let answer = confirm_candidate(&held(&dead), NOW, &refused, |_| {
+            let answer = confirm_candidate(&held(&dead), NOW, &memory, |_| {
                 reads.set(reads.get() + 1);
                 Err(ReadFailure::Rejected {
                     status: 401,
@@ -1596,13 +1720,13 @@ mod tests {
                 })
             });
             match answer {
-                Confirm::NotYet(reason) => assert!(reason.contains("refused"), "{reason}"),
+                Confirm::NotYet(reason) => assert!(reason.contains("rejected"), "{reason}"),
                 other => panic!("must keep waiting: {other:?}"),
             }
         }
         assert_eq!(reads.get(), 1, "the dead token was sent again");
 
-        let answer = confirm_candidate(&held(&token_until(NOW + 3601)), NOW, &refused, |_| {
+        let answer = confirm_candidate(&held(&token_until(NOW + 3601)), NOW, &memory, |_| {
             reads.set(reads.get() + 1);
             Ok(json!({ "results": [] }))
         });
@@ -1612,8 +1736,8 @@ mod tests {
 
     #[test]
     fn a_failure_waiting_will_not_fix_ends_the_wait() {
-        let refused = Mutex::new(None);
-        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &refused, |_| {
+        let memory = WindowMemory::default();
+        let answer = confirm_candidate(&held(&token_until(NOW + 3600)), NOW, &memory, |_| {
             Err(ReadFailure::Throttled { retry_after: None })
         });
         match answer {
@@ -1624,14 +1748,14 @@ mod tests {
 
     #[test]
     fn a_window_with_nothing_readable_keeps_waiting() {
-        let refused = Mutex::new(None);
+        let memory = WindowMemory::default();
         let none = pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST).build();
         let junk = pk_cli_browser::Captured::for_test("Robinhood", capture::WEB_HOST)
             .value("not a session")
             .build();
         for candidate in [none, junk] {
             let answer =
-                confirm_candidate(&candidate, NOW, &refused, |_| panic!("nothing to read yet"));
+                confirm_candidate(&candidate, NOW, &memory, |_| panic!("nothing to read yet"));
             assert!(matches!(answer, Confirm::NotYet(_)), "{answer:?}");
         }
     }
@@ -1867,6 +1991,207 @@ mod tests {
             || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "has.dot");
         assert!(!logout_browser(forget).unwrap());
         assert!(other.exists());
+    }
+
+    /// A name is taken as given by a logout now, so it must not reach outside the
+    /// data directory: the crate refuses it before it builds a path.
+    #[test]
+    fn a_logout_name_cannot_escape_the_data_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join(format!("piekstra.{}", config::BIN));
+        let sibling = parent.join("escape");
+        let outside = root.path().join("escape");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for name in [
+            "../escape",
+            "../../escape",
+            "x/../../escape",
+            "/absolute",
+            "..",
+        ] {
+            let forget = || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, name);
+            assert!(!logout_browser(forget).unwrap(), "{name}");
+        }
+        assert!(sibling.exists());
+        assert!(outside.exists());
+    }
+
+    /// A first sign-in that failed leaves a kept profile under a name the config
+    /// never recorded. Once another login is configured, that name can still be
+    /// logged out, reads of it stay refused, and the other login is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sign_ins_profile_can_be_logged_out_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        drop(signing_in(root.path(), &chrome, "dummy-first", false).unwrap());
+        let kept = kept_dir(root.path(), "dummy-first");
+        assert!(kept.exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let mut cfg = Config::default();
+        cfg.profiles
+            .insert("dummy-second".into(), Default::default());
+        store.save(&cfg).unwrap();
+
+        let loaded: Result<Config, CliError> = store.load();
+        let refused = loaded
+            .as_ref()
+            .unwrap()
+            .require_profile(Some("dummy-first"))
+            .unwrap_err();
+        assert_eq!(refused.exit_code(), 4, "{refused}");
+
+        let name = logout_target(&loaded, Some("dummy-first")).unwrap();
+        assert_eq!(name, "dummy-first");
+        let note = unconfigured_note(&loaded, &name).unwrap();
+        assert!(note.contains("not a configured login"), "{note}");
+        assert!(note.contains("dummy-second"), "{note}");
+
+        let mut deleted = Vec::new();
+        let removed = finish_logout(
+            &store,
+            loaded,
+            &name,
+            false,
+            |key| {
+                deleted.push(key.to_string());
+                Ok(())
+            },
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, &name),
+        )
+        .unwrap();
+        assert!(removed);
+        assert!(!kept.exists());
+        assert!(deleted.contains(&config::token_key("dummy-first")));
+        let cfg: Config = store.load().unwrap();
+        assert!(cfg.profiles.contains_key("dummy-second"));
+        assert!(unconfigured_note(&Ok(cfg), "dummy-second").is_none());
+    }
+
+    /// A far future, so the import's own clock never sees the token expire.
+    const FAR: u64 = 4_102_444_800;
+
+    fn accepted_page() -> Value {
+        json!({ "results": [{ "account_number": "DUMMY00001" }], "next": null })
+    }
+
+    /// A session the hook accepted is stored on that proof: the hook's is the only
+    /// read, whatever another would have answered, so a throttle loses no finished
+    /// sign-in. The config records the login from the page the hook kept.
+    #[test]
+    fn a_session_the_hook_accepted_is_stored_with_no_second_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let memory = WindowMemory::default();
+        let token = token_until(FAR);
+        let reads = std::cell::Cell::new(0);
+        let answer = confirm_candidate(&held(&token), NOW, &memory, |_| {
+            reads.set(reads.get() + 1);
+            Ok(accepted_page())
+        });
+        assert!(matches!(answer, Confirm::Ready), "{answer:?}");
+
+        let common = CommonArgs {
+            quiet: true,
+            ..CommonArgs::default()
+        };
+        let mut saved = None;
+        through_the_window(
+            "dummy-one",
+            false,
+            || Ok(held(&token)),
+            |raw| {
+                finish_window(
+                    &common,
+                    &store,
+                    Config::default(),
+                    "dummy-one",
+                    &raw,
+                    &memory,
+                    |tokens| {
+                        saved = Some(tokens.access_token.clone());
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(saved.as_deref(), Some(token.as_str()));
+        let cfg: Config = store.load().unwrap();
+        assert!(cfg.profiles.contains_key("dummy-one"));
+    }
+
+    /// With no page from the hook there is no proof, and it does not go and read.
+    #[test]
+    fn a_capture_with_no_proof_is_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let raw = Secret::new(
+            held(&token_until(FAR))
+                .value()
+                .unwrap()
+                .expose()
+                .to_string(),
+        );
+        let err = finish_window(
+            &CommonArgs::default(),
+            &store,
+            Config::default(),
+            "dummy-one",
+            &raw,
+            &WindowMemory::default(),
+            |_| panic!("nothing proven must be stored"),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 5, "{err}");
+    }
+
+    /// A piped session has had no read yet, so its read still decides.
+    #[test]
+    fn a_piped_session_is_proven_only_by_its_own_read() {
+        let raw = Secret::new(
+            held(&token_until(FAR))
+                .value()
+                .unwrap()
+                .expose()
+                .to_string(),
+        );
+        let err = prove_import(&raw, Source::Stdin, |_| {
+            Err(ReadFailure::Throttled { retry_after: None })
+        })
+        .err()
+        .expect("a failed read proves nothing");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        let proven = prove_import(&raw, Source::Stdin, |_| Ok(accepted_page()))
+            .ok()
+            .unwrap();
+        assert_eq!(proven.visible.len(), 1);
+    }
+
+    /// A bot check on the hook's read names itself, on every poll, so the timeout
+    /// does not call a signed-in tab a dead session.
+    #[test]
+    fn a_403_html_answer_keeps_its_reason() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Just a moment...</title></html>";
+        let memory = WindowMemory::default();
+        let token = token_until(NOW + 3600);
+        for _ in 0..2 {
+            let answer = confirm_candidate(&held(&token), NOW, &memory, |_| {
+                crate::client::classify(403, "https://example.invalid/accounts/", None, PAGE)
+            });
+            match answer {
+                Confirm::NotYet(reason) => {
+                    assert!(reason.contains("HTTP 403"), "{reason}");
+                    assert!(reason.contains("bot check"), "{reason}");
+                }
+                other => panic!("must keep waiting: {other:?}"),
+            }
+        }
     }
 
     /// `rhd`'s rule and the crate's must agree, or a name `profiles add` takes

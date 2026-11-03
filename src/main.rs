@@ -141,9 +141,9 @@ enum AuthCmd {
     /// the password login are the fallbacks.
     ///
     /// --browser opens https://robinhood.com/login in a Chrome profile rhd
-    /// keeps for this login. You sign in there, and rhd takes the session the web app
-    /// stores, closes the window, proves the session with one read of your
-    /// accounts, and keeps it in the OS keychain (docs/api.md §2.8).
+    /// keeps for this login. You sign in there, rhd proves the session the web app
+    /// stores with one read of your accounts, closes the window, and keeps it in
+    /// the OS keychain (docs/api.md §2.8).
     ///
     /// Without Chrome, --session-stdin imports a session you copy out of
     /// DevTools in your own browser. With neither flag, rhd logs in with the
@@ -224,12 +224,11 @@ password and any code are entered on Robinhood's own page, never in rhd.
 rhd starts Chrome at https://robinhood.com/login in a profile it keeps for
 this login, separate from every other login's. Sign in there, answering any
 code or approval Robinhood asks for. Once the robinhood.com page holds a
-session Robinhood accepts, rhd takes it from that page only
-(localStorage['web:auth_state'], plus the device_id cookie) and closes
-the tab at once, so the web app cannot renew the session out from under
-rhd. Then it quits Chrome, reads your accounts once with the session, and
-stores it in the OS keychain only if that read succeeds. It never prints
-the token.
+session Robinhood accepts, which one read of your accounts decides, rhd
+takes it from that page only (localStorage['web:auth_state'], plus the
+device_id cookie) and closes the tab at once, so the web app cannot renew
+the session out from under rhd. Then it quits Chrome and stores the session
+in the OS keychain, with no second read. It never prints the token.
 
 The kept profile lets Robinhood remember this device, so a later sign-in
 often asks for less. It is a full Chrome profile, owner-only on disk:
@@ -763,21 +762,11 @@ fn validate(command: &Command) -> Result<(), CliError> {
     }
 }
 
-/// `auth logout`, which a config that cannot be parsed must not stop: every step
-/// but the config entry needs only the login's name. Without `--profile` or
-/// `$RHD_PROFILE` the name is in that file, and this does not guess: the default
-/// name could log out the wrong login, or none, and say it had.
+/// `auth logout`, which neither a config that cannot be parsed nor a name it does not
+/// know may stop ([`commands::auth::logout_target`]).
 fn auth_logout(cli: &Cli, store: &ConfigStore, args: &LogoutArgs) -> Result<(), CliError> {
     let cfg: Result<Config, CliError> = store.load();
-    let profile = match &cfg {
-        Ok(cfg) => cfg.require_profile(cli.profile.as_deref())?,
-        Err(e) => config::named_profile(cli.profile.as_deref()).ok_or_else(|| {
-            CliError::Other(format!(
-                "{e}. That file says which login to log out, so nothing is cleared yet: name it \
-                 with `rhd auth logout --profile <NAME>`"
-            ))
-        })?,
-    };
+    let profile = commands::auth::logout_target(&cfg, cli.profile.as_deref())?;
     commands::auth::logout(&cli.common, store, cfg, &profile, args.forget)
 }
 

@@ -77,11 +77,11 @@ stored the browser sign-in's session (web:auth_state) into profile `primary` —
 renews unattended: the refresh token is stored; the access token is good until …
 ```
 
-As soon as the robinhood.com page holds a session Robinhood accepts, `rhd` takes
-it (the web app's `web:auth_state` and its `device_id` cookie, from robinhood.com
-only), closes the tab and quits Chrome. It then reads your accounts once with the
-session and stores it in the OS keychain only if that read succeeds; it never
-prints the token. Closing the tab at once matters: the web app and `rhd` would
+As soon as the robinhood.com page holds a session Robinhood accepts, which one read
+of your accounts decides, `rhd` takes it (the web app's `web:auth_state` and its
+`device_id` cookie, from robinhood.com only), closes the tab, quits Chrome and stores
+the session in the OS keychain, with no second read; it never prints the token.
+Closing the tab at once matters: the web app and `rhd` would
 otherwise share one refresh token that rotates on every renewal, and a later Log
 out in that window would revoke it. The session lands where a password login's
 would, so every command works unchanged and `auth status` reports

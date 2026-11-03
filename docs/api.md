@@ -298,10 +298,10 @@ session is read over the Chrome DevTools Protocol:
 | --- | --- |
 | Launch | `https://robinhood.com/login` in a plain Chrome: a debug port Chrome picks, the kept `--user-data-dir` for this login (below; `--fresh-profile` uses a scratch one, created `0700` under an unpredictable name), first-run suppression, and no automation flags. Chrome, Chromium or Edge at the standard install paths; `RHD_CHROME` names another binary |
 | Host | exactly `robinhood.com` (`HostRule::exact`): an `https` page on the default port whose parsed host is `robinhood.com`, and an answering document whose own `location.hostname` is too. Pages on `api.robinhood.com`, `www.robinhood.com` or a look-alike are never evaluated or closed. The login page is on the same host, so the check also runs there while the owner signs in; it reads `localStorage` and `document.cookie`, changes nothing, and answers `null` until signed in |
-| Expression | polled every few seconds in those pages (below). `null` until `localStorage['web:auth_state']` parses (a double-encoded value too) and holds a non-empty `access_token`, so the tab is never closed on a half-written session; then it removes that entry and answers with the session as JSON, with the `device_id` cookie added as `device_token`, or `device_token: null` when `document.cookie` cannot see it |
+| Expression | polled every few seconds in those pages (below). `null` until `localStorage['web:auth_state']` parses (a double-encoded value too) and holds a non-empty `access_token`, so the tab is never closed on a half-written session; then answers with the stored session as JSON, with the `device_id` cookie added as `device_token`, or `device_token: null` when `document.cookie` cannot see it |
 | Cookie | `device_id`, as the browser would send it to `https://robinhood.com/`, read from the browser's cookie jar (`Storage.getCookies`, which includes `HttpOnly` cookies). Optional: the capture never waits on it. When the expression's `device_token` is null, `rhd` fills it from this cookie before parsing |
 | Confirm | the hook takes the session only if it parses, is not past the point `rhd` would renew it (a minute before expiry) and Robinhood answers one read of `/accounts/` with its accounts list. A read that cannot decide (a throttle, Robinhood down) ends the wait; otherwise the tab stays open and the wait goes on (below) |
-| Then | every robinhood.com tab is closed the instant the session is confirmed, and Chrome is stopped. The value goes to the same parser as `--session-stdin`, the same proving read and the same keychain item, so the two paths store identical credentials. `session-import/v1` reports `source: "browser"` |
+| Then | every robinhood.com tab is closed the instant the session is confirmed, and Chrome is stopped. The value goes to the same parser and the same keychain item as `--session-stdin`, with the accounts page the hook accepted as its proof and no second read, so the two paths store identical credentials. `session-import/v1` reports `source: "browser"` |
 | Wait | up to 10 minutes; status lines on stderr (`-q` silences them); Ctrl-C cancels. A timeout or a window closed before sign-in is exit 3 naming `rhd auth login --browser --profile <NAME>`; no Chrome is exit 1 pointing at `--session-stdin`. Every failure once Chrome has run in the kept profile adds that the profile stays and what removes it, whichever step failed (`commands::auth::through_the_window`) |
 
 ```js
@@ -330,7 +330,10 @@ too. Its `device_id` cookie carries over (the web sets it for 10 years), so a la
 sign-in presents a device Robinhood has seen. `--fresh-profile` uses a scratch
 profile for one run instead. `auth logout` and `profiles remove` remove that login's
 as their browser step, and name refusals (a sign-in or a Chrome using it, a symlink,
-another user's) as exit 1, saying what is already cleared and how to finish. Chrome
+another user's) as exit 1, saying what is already cleared and how to finish. A logout
+that names a login runs every step even if the config does not know that name, so what
+a failed first sign-in left can be removed; the name is checked as a browser profile's
+is, so it cannot leave the data directory. Chrome
 is asked to quit over its debug port, so a cookie Robinhood sets just before the close
 reaches the disk; cli-common measured that in headless Chrome, not in a visible
 window. SECURITY.md lists what the profile holds.
@@ -364,15 +367,19 @@ expression only reads.
 not parse, is past the point `rhd` would renew it, or that Robinhood refuses, until a
 new sign-in replaces it. `rhd` renews a minute before expiry, so the hook goes by the
 renewal rule (`Tokens::is_expired_at`), not the bare expiry, and a session is never
-stored already due for renewal. A refused token is remembered for the run and not sent
-again, so a tab on a dead session costs one read rather than one per poll. A read that
+stored already due for renewal. A refused token is remembered for the run with what
+the read said, and not sent again, so a tab on a dead session costs one read rather
+than one per poll, and the timeout names the cause. A read that
 cannot decide ends the wait with an error and takes nothing: a 429 or a 5xx whatever
 its body, or a success that is not the accounts list. An HTML page on any other status
 counts as a refusal; the tab stays open and that token is not sent again. `rhd` itself
 never renews from the window.
 
-A confirmed capture is read twice: once by the hook, to decide whether the tab
-closes, and once after it, to decide whether anything is stored.
+A confirmed capture gets that one read. Once the hook has said ready, Chrome has
+stopped and site storage is gone, so a 429, a 5xx or a dropped connection on another
+read would throw a finished sign-in away. The hook keeps the accounts page it accepted,
+and the import takes that as its proof. A session from `--session-stdin` has its own
+read before the keychain write.
 
 **A known device after the first sign-in — UNVERIFIED-LIVE.** A kept profile
 starts with no cookies only the first time, so that first `--browser` sign-in (and
@@ -417,7 +424,8 @@ reports `method: browser-session` for both paths, and `info` reports the same
 method with `rhd auth login --browser` as its login hint.
 
 **Proved before storing, with one read.** `GET /accounts/` with §3.2's
-all-accounts query, using the captured token. On any failure nothing is stored
+all-accounts query, using the captured token: `--browser` spends it in the confirm
+hook, and `--session-stdin` right after parsing. On any failure nothing is stored
 and the error says where the session came from and which shape it was read
 as. A token whose `exp` has already passed is refused before the request (it
 could only 401): for a paste, reloading robinhood.com renews the web's

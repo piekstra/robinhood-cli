@@ -104,7 +104,6 @@ pub fn pending_key(profile: &str) -> String {
     format!("{profile}/pending")
 }
 
-/// On-disk, non-secret settings.
 /// The login named by `--profile` or `$RHD_PROFILE`, if either does: what is known
 /// without the config.
 pub fn named_profile(flag: Option<&str>) -> Option<String> {
@@ -114,6 +113,7 @@ pub fn named_profile(flag: Option<&str>) -> Option<String> {
     std::env::var(PROFILE_ENV).ok().filter(|p| !p.is_empty())
 }
 
+/// On-disk, non-secret settings.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Profile used when neither `--profile` nor `$RHD_PROFILE` is given.
