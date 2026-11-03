@@ -96,23 +96,27 @@ systems use a scratch profile every time. `rhd auth login --browser
 --fresh-profile` signs in once through a scratch profile, deleted afterwards, and
 leaves the kept one alone.
 
-The trade is more than cookies. `rhd` takes the session's tokens out of the
-profile as it reads them, but it is a full Chrome profile, so it also keeps
-browsing history with full URLs, query strings included, the HTTP cache and site
-storage, for whatever you open in that window. Chrome's cookie encryption does
-not cover those: the directory's `0700` mode is their only protection, and
-ordinary backups usually include the directory ([`SECURITY.md`](SECURITY.md)). On
-Linux with no desktop keyring Chrome encrypts the cookies with a fixed, publicly
-known key, so there the session cookie has only `0700` too.
+The trade is more than cookies. It is a full Chrome profile, so it also keeps a
+copy of the session's access and refresh tokens, browsing history with full URLs,
+query strings included, the HTTP cache and site storage, for whatever you open in
+that window. Chrome's cookie encryption does not cover those: the directory's `0700`
+mode is their only protection, and ordinary backups usually include the directory
+([`SECURITY.md`](SECURITY.md)). On Linux with no desktop keyring Chrome encrypts the
+cookies with a fixed, publicly known key, so there the session cookie has only
+`0700` too.
 
 The profile stays after a failed sign-in too, and every failure once the window has
 opened says so: a timeout, a closed window, Ctrl-C, Robinhood throttled or down
 during the check, a keychain write that fails. Those can leave a live session in
 it. `rhd auth status` reads only the keychain and config, so it does
 not show the profile. `rhd auth logout` and `rhd profiles remove` remove it, for
-that login only, and clear its stored session with it. While a sign-in or a Chrome
-window is using the profile, they clear the session, exit 1 and say what remains;
-close the window and run the command again.
+that login only, and clear its stored session with it. They attempt every step even
+after one fails, then say what is cleared and what remains, and exit with the first
+failure's code. While a sign-in or a Chrome window is using the profile, they clear
+the session, exit 1 and say what remains; close the window and run the command again.
+With a config file it cannot parse, `rhd auth logout --profile <NAME>` still runs
+every step but the config entry; without `--profile` or `RHD_PROFILE` it asks which
+login, since the name is in that file.
 
 A login whose name a Chrome profile cannot carry (anything but 1 to 64 ASCII
 letters, digits, `-` or `_`, which `rhd profiles add` already refuses) cannot keep

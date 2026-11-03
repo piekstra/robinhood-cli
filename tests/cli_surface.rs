@@ -262,17 +262,57 @@ fn the_help_says_what_happens_to_the_kept_profile() {
         .assert()
         .success()
         .stdout(contains("kept browser profile"))
-        .stdout(contains("exits 1"))
+        .stdout(contains("first failure's code"))
         .stdout(contains("already cleared"));
     rhd()
         .args(["profiles", "remove", "--help"])
         .assert()
         .success()
-        .stdout(contains("kept browser"));
+        .stdout(contains("kept browser"))
+        .stdout(contains("first failure's code"));
+    // The command lists show the summary, on one line; the detail is above.
+    for (group, command, summary) in [
+        (
+            "auth",
+            "logout",
+            "Clear the session and remove the kept browser profile",
+        ),
+        (
+            "profiles",
+            "remove",
+            "Remove a login profile, its credentials and its kept browser profile",
+        ),
+    ] {
+        let out = rhd().args([group, "--help"]).assert().success();
+        let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+        let row = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(command))
+            .unwrap_or_else(|| panic!("no {command} row in:\n{text}"));
+        assert!(row.trim_end().ends_with(summary), "{row}");
+        assert!(!text.contains("first failure's code"), "{text}");
+    }
 }
 
-/// The capture takes the session out of the profile `rhd` keeps. The Console
-/// snippet runs in the owner's own browser, so it must never do the same.
+/// A config that cannot be parsed says which login to log out when no flag does.
+/// Logout does not guess: it stops here, before the keychain, and says how to go on.
+#[test]
+fn logout_with_a_broken_config_asks_which_login() {
+    let config = scratch_config("brokenlogout");
+    std::fs::write(&config, "not json").unwrap();
+    rhd()
+        .env_remove("RHD_PROFILE")
+        .arg("--config")
+        .arg(&config)
+        .args(["auth", "logout"])
+        .assert()
+        .code(1)
+        .stderr(contains("parsing"))
+        .stderr(contains("--profile <NAME>"));
+}
+
+/// The Console snippet runs in the owner's own browser, so it must never change
+/// what it reads.
 #[test]
 fn the_console_snippet_stays_read_only() {
     let out = rhd().args(["auth", "login", "--help"]).assert().success();

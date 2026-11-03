@@ -14,19 +14,19 @@
 //!   after a real read succeeds with it, so a login that authenticates but
 //!   can't fetch anything leaves nothing broken behind. That holds for a
 //!   session from a browser (`--browser`, `--session-stdin`) too.
-//! - **A retired token must not stay where a window can use it.** `--browser`
-//!   runs Chrome in a profile kept per login, so a re-login often asks for less.
-//!   The capture takes the session out of that profile as it reads it
-//!   ([`capture::SESSION_EXPRESSION`]), and the tab closes only on a session
-//!   Robinhood accepts ([`confirm_candidate`]).
-//! - **The kept profile is a full Chrome profile:** Robinhood's cookies, browsing
-//!   history with full URLs, query strings included, the HTTP cache and site
-//!   storage. Chrome's cookie encryption does not cover the last three, so the
-//!   directory's `0700` mode is their only protection, and ordinary backups
-//!   usually include it. On Linux with no desktop keyring Chrome encrypts the
-//!   cookies with a fixed, publicly known key, so there the session cookie has
-//!   only `0700` too. It stays on disk until `auth logout` or `profiles remove`
-//!   removes it ([`logout_browser`]), after a failed sign-in too
+//! - **A retired token is not taken from a window.** `--browser` runs Chrome in a
+//!   profile kept per login, so a re-login often asks for less, and that profile
+//!   still holds the page's copy of the tokens: the capture only reads
+//!   ([`capture::SESSION_EXPRESSION`]). The tab closes only on a session Robinhood
+//!   accepts ([`confirm_candidate`]).
+//! - **The kept profile is a full Chrome profile:** Robinhood's cookies, the
+//!   session's tokens, browsing history with full URLs, query strings included, the
+//!   HTTP cache and site storage. Chrome's cookie encryption does not cover anything
+//!   but the cookies, so the directory's `0700` mode is their only protection, and
+//!   ordinary backups usually include it. On Linux with no desktop keyring Chrome
+//!   encrypts the cookies with a fixed, publicly known key, so there the session
+//!   cookie has only `0700` too. It stays on disk until `auth logout` or `profiles remove`
+//!   removes it ([`finish_logout`]), after a failed sign-in too
 //!   ([`through_the_window`]).
 
 use std::sync::Mutex;
@@ -304,10 +304,10 @@ pub fn browser_login(
 /// place, so a new one cannot miss [`failed_sign_in`]: the window's own ending,
 /// the confirm hook's, the read after it and the keychain write.
 ///
-/// Only three failures skip the note, because they end the sign-in before Chrome
-/// runs in the profile: no Chrome, which points at the DevTools fallback instead, a
-/// malformed launch, and a profile refused for repair, whose own message names the
-/// path and the fix.
+/// Only four failures skip the note, because they end the sign-in before this
+/// Chrome uses the profile: no Chrome, which points at the DevTools fallback
+/// instead, a malformed launch, and a profile refused for repair or already in use,
+/// whose own messages name the path and the fix.
 fn through_the_window(
     profile: &str,
     fresh_profile: bool,
@@ -321,7 +321,11 @@ fn through_the_window(
                  auth login --help` walks through `--session-stdin`"
             )))
         }
-        Err(e @ (BrowserError::Invalid(_) | BrowserError::Profile(_))) => return Err(e.into()),
+        Err(
+            e @ (BrowserError::Invalid(_)
+            | BrowserError::Profile(_)
+            | BrowserError::ProfileInUse(_)),
+        ) => return Err(e.into()),
         other => other,
     };
     captured
@@ -361,12 +365,11 @@ fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Lau
 
 /// Whether the session in the window is one to take, which closes the tab.
 ///
-/// A capture takes `web:auth_state` out of the profile it reads from, but one
-/// can still be there as the page opens: left by a sign-in that ended before the
-/// read, or by a Chrome stopped before its removal reached the disk. It may be
-/// expired or already rotated away. Taking it would close the tab before the web
-/// app could ask the owner to sign in. So a session that does not parse, is past
-/// the point `rhd` would renew it, or that Robinhood refuses keeps the tab open.
+/// The kept profile still holds the last sign-in's `web:auth_state` as the page
+/// opens. It may be expired or already rotated away. Taking it would close the tab
+/// before the web app could ask the owner to sign in. So a session that does not
+/// parse, is past the point `rhd` would renew it, or that Robinhood refuses keeps
+/// the tab open.
 ///
 /// That point is [`Tokens::is_expired_at`], `rhd`'s own renewal rule, not the
 /// token's bare expiry: in between, `rhd` may have rotated the refresh token
@@ -453,7 +456,7 @@ fn failed_sign_in(error: CliError, profile: &str, fresh_profile: bool) -> CliErr
     if fresh_profile || !cfg!(unix) {
         return error;
     }
-    let note = |m: String| {
+    reworded(error, |m| {
         format!(
             "{}. The browser profile stays on disk with what that window left in it, which can \
              be a live session; once no window is using it, `rhd auth logout --profile \
@@ -461,15 +464,19 @@ fn failed_sign_in(error: CliError, profile: &str, fresh_profile: bool) -> CliErr
              signs in without it.",
             m.trim_end_matches('.')
         )
-    };
+    })
+}
+
+/// The same failure, with the same exit code, saying something else.
+fn reworded(error: CliError, say: impl FnOnce(String) -> String) -> CliError {
     match error {
-        CliError::Usage(m) => CliError::Usage(note(m)),
-        CliError::Auth(m) => CliError::Auth(note(m)),
-        CliError::NotFound(m) => CliError::NotFound(note(m)),
-        CliError::Upstream(m) => CliError::Upstream(note(m)),
-        CliError::ConfirmationRequired(m) => CliError::ConfirmationRequired(note(m)),
-        CliError::Keychain(m) => CliError::Keychain(note(m)),
-        CliError::Other(m) => CliError::Other(note(m)),
+        CliError::Usage(m) => CliError::Usage(say(m)),
+        CliError::Auth(m) => CliError::Auth(say(m)),
+        CliError::NotFound(m) => CliError::NotFound(say(m)),
+        CliError::Upstream(m) => CliError::Upstream(say(m)),
+        CliError::ConfirmationRequired(m) => CliError::ConfirmationRequired(say(m)),
+        CliError::Keychain(m) => CliError::Keychain(say(m)),
+        CliError::Other(m) => CliError::Other(say(m)),
     }
 }
 
@@ -607,10 +614,10 @@ impl SessionImport {
             ));
         }
         out.push(match self.source {
-            // The window closed on capture, and the session left its profile.
-            Source::Browser => "the sign-in window is closed and the session is out of its Chrome \
-                                profile, so no browser can renew it or log it out; the profile \
-                                stays on disk for the next sign-in until `rhd auth logout` \
+            // The window closed on capture, and its profile keeps the page's copy.
+            Source::Browser => "the sign-in window is closed, so no browser is renewing this \
+                                session; its Chrome profile, with a copy of the session's tokens \
+                                in it, stays on disk for the next sign-in until `rhd auth logout` \
                                 removes it"
                 .into(),
             Source::Stdin => "close the robinhood.com tab, but do not click Log out: logging out \
@@ -732,25 +739,19 @@ pub fn status(
 pub fn logout(
     common: &CommonArgs,
     store: &ConfigStore,
-    mut cfg: Config,
+    cfg: Result<Config, CliError>,
     profile: &str,
     forget: bool,
 ) -> Result<(), CliError> {
     let creds = CredentialStore::for_binary(config::BIN);
-
-    // The cached session and any half-finished login always go; `logout`
-    // that leaves a resumable attempt behind isn't a logout.
-    creds.delete(&config::token_key(profile))?;
-    creds.delete(&config::pending_key(profile))?;
-
-    if forget {
-        creds.delete(&config::password_key(profile))?;
-        creds.delete(&config::device_key(profile))?;
-    }
-
-    let browser = finish_logout(store, &mut cfg, profile, forget, || {
-        pk_cli_browser::forget_named_profile(config::BIN, profile)
-    })?;
+    let browser = finish_logout(
+        store,
+        cfg,
+        profile,
+        forget,
+        |key| creds.delete(key).map(|_| ()),
+        || pk_cli_browser::forget_named_profile(config::BIN, profile),
+    )?;
 
     if !common.quiet {
         eprintln!("{}", logged_out(profile, forget, browser));
@@ -758,43 +759,170 @@ pub fn logout(
     Ok(())
 }
 
-/// A logout's steps past the keychain; `true` when there was a browser profile
-/// to remove. The browser profile goes before the config entry: a refusal (its
-/// window still open) leaves the credentials cleared and asks for another try,
-/// which with `--forget` has to find the profile still configured. Its error
-/// says what is already gone ([`logout_refused`]).
+/// A logout's steps, each attempted whatever an earlier one did: one that fails
+/// must not leave a session behind in the others. `true` when there was a browser
+/// profile to remove. The keychain and the profile's removal are passed in, so a
+/// test can fail any step and reach neither the keychain nor the owner's real
+/// profile.
+///
+/// The one exception is the config entry with `--forget`. It goes last, and only
+/// once everything else is clear: [`Config::require_profile`] refuses an unconfigured
+/// name once other logins exist, so without it the retry the error asks for could
+/// not find what remains. A config that cannot be parsed is passed in as the
+/// failure it is: it stops no other step, and only that entry stays.
 fn finish_logout(
     store: &ConfigStore,
-    cfg: &mut Config,
+    cfg: Result<Config, CliError>,
     profile: &str,
     forget: bool,
+    mut delete: impl FnMut(&str) -> Result<(), CliError>,
     forget_browser: impl FnOnce() -> Result<bool, BrowserError>,
 ) -> Result<bool, CliError> {
-    let browser = logout_browser(forget_browser).map_err(|e| {
-        if forget {
-            logout_refused(
-                &format!("the session and stored credentials of profile `{profile}` are cleared"),
-                "the browser profile and this login's config entry remain",
-                &format!("rhd auth logout --forget --profile {profile}"),
-                &e,
-            )
-        } else {
-            logout_refused(
-                &format!("the session of profile `{profile}` is cleared"),
-                "only the browser profile remains",
-                &format!("rhd auth logout --profile {profile}"),
-                &e,
-            )
-        }
-    })?;
-    if forget {
-        cfg.profiles.remove(profile);
-        if cfg.default_profile.as_deref() == Some(profile) {
-            cfg.default_profile = None;
-        }
-        store.save(cfg)?;
+    let mut steps = TeardownSteps::default();
+    // The cached session and any half-finished login always go; `logout`
+    // that leaves a resumable attempt behind isn't a logout.
+    steps.step("the session", delete(&config::token_key(profile)));
+    if let Err(e) = delete(&config::pending_key(profile)) {
+        steps.failed("a half-finished login", e);
     }
+    if forget {
+        steps.step(
+            "the stored password",
+            delete(&config::password_key(profile)),
+        );
+        steps.step("the device token", delete(&config::device_key(profile)));
+    }
+    let browser = steps.browser(forget_browser);
+    if forget {
+        const ENTRY: &str = "this login's config entry";
+        match cfg {
+            Err(e) => steps.failed(ENTRY, e),
+            Ok(mut cfg) if steps.is_clean() => {
+                cfg.profiles.remove(profile);
+                if cfg.default_profile.as_deref() == Some(profile) {
+                    cfg.default_profile = None;
+                }
+                if let Err(e) = store.save(&cfg) {
+                    steps.failed(ENTRY, e);
+                }
+            }
+            Ok(_) => steps.remains(ENTRY),
+        }
+    }
+    let finish = format!(
+        "rhd auth logout{} --profile {profile}",
+        if forget { " --forget" } else { "" }
+    );
+    steps.report(&format!("partly logged out of `{profile}`"), &finish)?;
     Ok(browser)
+}
+
+/// What a logout or a `profiles remove` got done so far. Its steps run to the end
+/// whatever fails, then [`report`](Self::report) says what is cleared and what
+/// remains, with the first failure's exit code.
+#[derive(Default)]
+pub(crate) struct TeardownSteps {
+    cleared: Vec<String>,
+    remains: Vec<String>,
+    reasons: Vec<String>,
+    first: Option<CliError>,
+    finish_when: Option<&'static str>,
+}
+
+impl TeardownSteps {
+    pub(crate) fn step(&mut self, what: &str, result: Result<(), CliError>) {
+        match result {
+            Ok(()) => self.cleared.push(what.to_string()),
+            Err(e) => self.failed(what, e),
+        }
+    }
+
+    pub(crate) fn failed(&mut self, what: &str, error: CliError) {
+        self.remains(what);
+        self.reasons
+            .push(inner_message(&error).trim_end_matches('.').to_string());
+        self.first.get_or_insert(error);
+    }
+
+    /// Something left on purpose, which fails nothing.
+    pub(crate) fn remains(&mut self, what: &str) {
+        self.remains.push(what.to_string());
+    }
+
+    pub(crate) fn is_clean(&self) -> bool {
+        self.first.is_none()
+    }
+
+    /// The profile's removal ([`logout_browser`]); `true` when there was one.
+    pub(crate) fn browser(&mut self, forget: impl FnOnce() -> Result<bool, BrowserError>) -> bool {
+        match logout_browser(forget) {
+            Ok(removed) => {
+                if removed {
+                    self.cleared.push("the browser profile".to_string());
+                }
+                removed
+            }
+            Err(e) => {
+                self.finish_when = Some(match e {
+                    BrowserError::ProfileInUse(_) => "Once that window is closed, run",
+                    _ => "Repair or delete that path, then run",
+                });
+                self.failed("the browser profile", e.into());
+                false
+            }
+        }
+    }
+
+    pub(crate) fn report(self, title: &str, finish: &str) -> Result<(), CliError> {
+        let Some(first) = self.first else {
+            return Ok(());
+        };
+        let cleared = match self.cleared.len() {
+            0 => "nothing is cleared".to_string(),
+            1 => format!("{} is cleared", self.cleared[0]),
+            _ => format!("{} are cleared", listed(&self.cleared)),
+        };
+        let remains = match self.remains.len() {
+            1 => format!("only {} remains", self.remains[0]),
+            _ => format!("{} remain", listed(&self.remains)),
+        };
+        let when = match self.reasons.len() {
+            1 => self.finish_when.unwrap_or("Fix that, then run"),
+            _ => "Fix those, then run",
+        };
+        let reasons = self.reasons.join(". ");
+        let message = format!(
+            "{title}: {cleared} and {remains}. {reasons}. {when} `{finish}` again to finish."
+        );
+        // The exit code is the first failure's. `Keychain` and `Other` share theirs,
+        // and `Other` puts no "keychain error:" in front of the whole report. Every
+        // step here fails as one of those two.
+        Err(match first {
+            CliError::Keychain(_) => CliError::Other(message),
+            first => reworded(first, |_| message),
+        })
+    }
+}
+
+/// A failure's own message, without the prefix its `Display` puts on.
+fn inner_message(error: &CliError) -> &str {
+    match error {
+        CliError::Usage(m)
+        | CliError::Auth(m)
+        | CliError::NotFound(m)
+        | CliError::Upstream(m)
+        | CliError::ConfirmationRequired(m)
+        | CliError::Keychain(m)
+        | CliError::Other(m) => m,
+    }
+}
+
+fn listed(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn logged_out(profile: &str, forget: bool, browser: bool) -> String {
@@ -814,16 +942,17 @@ fn logged_out(profile: &str, forget: bool, browser: bool) -> String {
 }
 
 /// The browser step of `auth logout` and `profiles remove`: `true` when there
-/// was a kept profile to remove. That profile holds Robinhood's own cookies, its
-/// browsing history and cache, so a logout removes it too and the next sign-in
-/// starts signed out. The removal is passed in: the binary binds it to
+/// was a kept profile to remove. That profile holds Robinhood's own cookies, a copy
+/// of the session's tokens, its browsing history and cache, so a logout removes it
+/// too and the next sign-in starts signed out. The removal is passed in: the
+/// binary binds it to
 /// `forget_named_profile(BIN, name)`, the tests to `forget_named_profile_in`
 /// under a temp dir, so a test never removes the owner's real profile.
 ///
 /// A name no Chrome profile can carry is not a failure here: a launch refuses
 /// it too ([`browser_launch`]), so it never had a kept profile to remove, and
 /// its logout is done. Busy (`ProfileInUse`) or in need of repair (`Profile`) is
-/// the caller's to report ([`logout_refused`]): the rest is cleared by then.
+/// the caller's to report ([`TeardownSteps::browser`]).
 pub(crate) fn logout_browser(
     forget: impl FnOnce() -> Result<bool, BrowserError>,
 ) -> Result<bool, BrowserError> {
@@ -831,25 +960,6 @@ pub(crate) fn logout_browser(
         Err(BrowserError::Invalid(_)) => Ok(false),
         other => other,
     }
-}
-
-/// A logout that exits 1 has still done most of its work, so its error says
-/// what is already gone, what remains and how to finish.
-pub(crate) fn logout_refused(
-    cleared: &str,
-    remains: &str,
-    finish: &str,
-    error: &BrowserError,
-) -> CliError {
-    let when = match error {
-        BrowserError::ProfileInUse(_) => "Once that window is closed, run",
-        _ => "Repair or delete that path, then run",
-    };
-    let reason = error.to_string();
-    CliError::Other(format!(
-        "partly logged out: {cleared} and {remains}. {}. {when} `{finish}` again to remove it.",
-        reason.trim_end_matches('.')
-    ))
 }
 
 pub fn set_credential(
@@ -1155,6 +1265,7 @@ mod tests {
         for error in [
             BrowserError::Invalid("dummy".into()),
             BrowserError::Profile("dummy".into()),
+            BrowserError::ProfileInUse("dummy".into()),
         ] {
             let err = through_the_window(
                 "primary",
@@ -1176,7 +1287,6 @@ mod tests {
             (BrowserError::WindowClosed("dummy.".into()), 3),
             (BrowserError::Canceled, 1),
             (BrowserError::Launch("dummy.".into()), 1),
-            (BrowserError::ProfileInUse("dummy.".into()), 1),
             (
                 BrowserError::Handler(CliError::Upstream("dummy.".into())),
                 5,
@@ -1308,8 +1418,10 @@ mod tests {
             (503, PAGE),
             (503, list),
             (200, ""),
+            (200, "null"),
             (200, "{}"),
             (200, "{nope"),
+            (200, r#"{"results":null}"#),
         ] {
             let refused = Mutex::new(None);
             let answer = confirm_candidate(&held(&token), NOW, &refused, |_| read(status, body));
@@ -1662,11 +1774,20 @@ mod tests {
                 "dummy: close that window, then log out again.".into(),
             ))
         };
-        let err = finish_logout(&store, &mut cfg, "dummy-one", false, in_use).unwrap_err();
+        let err = finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            false,
+            |_| Ok(()),
+            in_use,
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1, "{err}");
         let message = err.to_string();
         for needle in [
-            "the session of profile `dummy-one` is cleared",
+            "partly logged out of `dummy-one`",
+            "the session is cleared",
             "only the browser profile remains",
             "close that window",
             "Once that window is closed",
@@ -1676,11 +1797,19 @@ mod tests {
         }
 
         let needs_repair = || Err(BrowserError::Profile("dummy: is a symlink".into()));
-        let err = finish_logout(&store, &mut cfg, "dummy-one", true, needs_repair).unwrap_err();
+        let err = finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            true,
+            |_| Ok(()),
+            needs_repair,
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1, "{err}");
         let message = err.to_string();
         for needle in [
-            "the session and stored credentials of profile `dummy-one` are cleared",
+            "the session, the stored password and the device token are cleared",
             "the browser profile and this login's config entry remain",
             "symlink",
             "Repair or delete that path",
@@ -1690,9 +1819,8 @@ mod tests {
         }
     }
 
-    /// `--forget` drops the login from the config only once the browser
-    /// profile is gone: a refusal leaves it configured, because the retry the
-    /// message asks for would otherwise answer "no login profile named".
+    /// Without its config entry, `--profile` could not find the login again
+    /// once other logins exist, so the entry stays until the retry finishes.
     #[test]
     fn a_refused_forget_leaves_the_login_configured_for_the_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1704,20 +1832,217 @@ mod tests {
         cfg.profiles.insert("dummy-one".into(), Default::default());
         store.save(&cfg).unwrap();
 
-        let err = finish_logout(&store, &mut cfg, "dummy-one", true, || {
-            Err(BrowserError::ProfileInUse(
-                "dummy: close that window".into(),
-            ))
-        })
+        let err = finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            true,
+            |_| Ok(()),
+            || {
+                Err(BrowserError::ProfileInUse(
+                    "dummy: close that window".into(),
+                ))
+            },
+        )
         .unwrap_err();
         assert_eq!(err.exit_code(), 1);
         let saved: Config = store.load().unwrap();
         assert!(saved.profiles.contains_key("dummy-one"));
 
-        assert!(!finish_logout(&store, &mut cfg, "dummy-one", true, || Ok(false)).unwrap());
+        assert!(!finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            true,
+            |_| Ok(()),
+            || Ok(false)
+        )
+        .unwrap());
         let saved: Config = store.load().unwrap();
         assert!(!saved.profiles.contains_key("dummy-one"));
         assert_eq!(saved.default_profile, None);
+    }
+
+    /// A keychain step that fails stops nothing: every later item is still
+    /// tried, the browser profile is still removed, and the error says what is
+    /// cleared and what remains. The config entry stays for the retry.
+    #[test]
+    fn a_failed_keychain_step_stops_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let mut cfg = Config::default();
+        cfg.profiles.insert("dummy-one".into(), Default::default());
+        store.save(&cfg).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let kept = kept_dir(root.path(), "dummy-one");
+        std::fs::create_dir_all(&kept).unwrap();
+        let session = config::token_key("dummy-one");
+        let mut tried = Vec::new();
+        let err = finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            true,
+            |key| {
+                tried.push(key.to_string());
+                if key == session {
+                    Err(CliError::Keychain("dummy: could not delete".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            tried,
+            [
+                config::token_key("dummy-one"),
+                config::pending_key("dummy-one"),
+                config::password_key("dummy-one"),
+                config::device_key("dummy-one"),
+            ]
+        );
+        assert!(!kept.exists(), "the profile must be removed all the same");
+        assert_eq!(err.exit_code(), 1, "{err}");
+        let message = err.to_string();
+        for needle in [
+            "the stored password, the device token and the browser profile are cleared",
+            "the session and this login's config entry remain",
+            "dummy: could not delete",
+            "Fix that, then run",
+            "`rhd auth logout --forget --profile dummy-one` again",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        let saved: Config = store.load().unwrap();
+        assert!(saved.profiles.contains_key("dummy-one"));
+    }
+
+    /// A config entry that cannot be written comes last, so everything else is
+    /// already gone, and the error says only it remains.
+    #[test]
+    fn a_failed_config_write_leaves_only_the_config_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("a-file");
+        std::fs::write(&blocked, "").unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(blocked.join("c.json")));
+        let mut cfg = Config::default();
+        cfg.profiles.insert("dummy-one".into(), Default::default());
+
+        let err = finish_logout(
+            &store,
+            Ok(cfg.clone()),
+            "dummy-one",
+            true,
+            |_| Ok(()),
+            || Ok(true),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        for needle in [
+            "the browser profile are cleared",
+            "only this login's config entry remains",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+    }
+
+    /// The exit code is the first failure's, and every failure is named.
+    #[test]
+    fn a_failed_logout_exits_with_the_first_failures_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let err = finish_logout(
+            &store,
+            Ok(Config::default()),
+            "dummy-one",
+            false,
+            |_| Err(CliError::Auth("dummy first".into())),
+            || Err(BrowserError::ProfileInUse("dummy second".into())),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3, "{err}");
+        let message = err.to_string();
+        assert!(message.starts_with("partly logged out of "), "{message}");
+        for needle in [
+            "nothing is cleared",
+            "the session, a half-finished login and the browser profile remain",
+            "dummy first",
+            "dummy second",
+            "Fix those, then run",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+    }
+
+    /// A config that cannot be parsed stops no other step. Only with `--forget`
+    /// does logout need it, and then only the config entry stays.
+    #[test]
+    fn a_config_that_cannot_be_parsed_stops_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let broken = || Err(CliError::Other("parsing dummy: bad".into()));
+        let root = tempfile::tempdir().unwrap();
+        let kept = kept_dir(root.path(), "dummy-one");
+
+        std::fs::create_dir_all(&kept).unwrap();
+        let mut tried = 0;
+        let err = finish_logout(
+            &store,
+            broken(),
+            "dummy-one",
+            true,
+            |_| {
+                tried += 1;
+                Ok(())
+            },
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one"),
+        )
+        .unwrap_err();
+        assert_eq!(tried, 4);
+        assert!(!kept.exists(), "the profile must be removed all the same");
+        assert_eq!(err.exit_code(), 1, "{err}");
+        let message = err.to_string();
+        for needle in ["only this login's config entry remains", "parsing dummy"] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+
+        std::fs::create_dir_all(&kept).unwrap();
+        let removed = finish_logout(
+            &store,
+            broken(),
+            "dummy-one",
+            false,
+            |_| Ok(()),
+            || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one"),
+        )
+        .unwrap();
+        assert!(removed);
+        assert!(!kept.exists());
+    }
+
+    /// Built from the inner messages: no prefix in front of the report or inside
+    /// it, with the same exit code.
+    #[test]
+    fn a_keychain_failure_does_not_prefix_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let err = finish_logout(
+            &store,
+            Ok(Config::default()),
+            "dummy-one",
+            false,
+            |_| Err(CliError::Keychain("dummy: could not delete".into())),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
+        let message = err.to_string();
+        assert!(message.starts_with("partly logged out of "), "{message}");
+        assert!(!message.contains("keychain error"), "{message}");
     }
 
     #[test]

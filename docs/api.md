@@ -281,7 +281,7 @@ robinhood.com bundle, which needs no login to fetch:
 family's `pk-cli-browser` (cli-common, DESIGN.md §2.2). It starts Chrome in a
 profile `rhd` keeps for this login, the owner signs in on Robinhood's own page
 (password and any code or approval happen there, never in `rhd`), and the
-session is taken out over the Chrome DevTools Protocol:
+session is read over the Chrome DevTools Protocol:
 
 | | |
 | --- | --- |
@@ -294,7 +294,7 @@ session is taken out over the Chrome DevTools Protocol:
 | Wait | up to 10 minutes; status lines on stderr (`-q` silences them); Ctrl-C cancels. A timeout or a window closed before sign-in is exit 3 naming `rhd auth login --browser --profile <NAME>`; no Chrome is exit 1 pointing at `--session-stdin`. Every failure once Chrome has run in the kept profile adds that the profile stays and what removes it, whichever step failed (`commands::auth::through_the_window`) |
 
 ```js
-(() => { const raw = localStorage['web:auth_state']; if (!raw) return null; let s; try { s = JSON.parse(raw); if (typeof s === 'string') s = JSON.parse(s); } catch { return null; } if (!s || !s.access_token) return null; const d = (document.cookie.match(/(?:^|; )device_id=([^;]+)/) || [])[1]; localStorage.removeItem('web:auth_state'); return JSON.stringify({ ...s, device_token: d || null }); })()
+(() => { const raw = localStorage['web:auth_state']; if (!raw) return null; let s; try { s = JSON.parse(raw); if (typeof s === 'string') s = JSON.parse(s); } catch { return null; } if (!s || !s.access_token) return null; const d = (document.cookie.match(/(?:^|; )device_id=([^;]+)/) || [])[1]; return JSON.stringify({ ...s, device_token: d || null }); })()
 ```
 
 A browser session `rhd` cannot read (a `token_type` other than `Bearer`, a
@@ -330,37 +330,30 @@ it, exit 2, before Chrome starts; `--browser --fresh-profile` signs it in, since
 scratch profile needs no name; and its logout finishes, since it never had a
 profile to remove.
 
-**The cookies stay; the tokens do not.** A kept profile would otherwise start each
-window with the last sign-in's `web:auth_state`: an access token that has often
-expired and a refresh token `rhd` has rotated away. The capture would read it the
-moment the page opens and close the tab, and `capture::parse` would refuse it, on
-this run and every later one; or the web app would present the retired token,
-which at best signs it out and at worst ends the session `rhd` holds. Two gates
-stop it:
+**The tokens stay too.** A kept profile starts each window with the last sign-in's
+`web:auth_state`: an access token that has often expired and a refresh token `rhd`
+has rotated away. The expression only reads: a removal from the page may not reach
+the disk before Chrome stops, and the evaluation can run more than once. So:
 
-1. **The read takes the entry out.** The expression removes `web:auth_state` as it
-   answers, so the page starts the next window signed out.
-2. **The confirm hook judges what it read.** An entry can still be there: from a
-   sign-in that ended before the read, or a Chrome stopped before the removal
-   reached the disk. So the tab stays open on one that does not parse, is past the
-   point `rhd` would renew it, or that Robinhood refuses, until a new sign-in
-   replaces it. `rhd` renews a minute before expiry, so in that last minute a
-   working access token may belong to a refresh token already rotated away; storing
-   it would replace the live session, so the hook goes by the renewal rule
-   (`Tokens::is_expired_at`), not the bare expiry. A refused token is remembered for
-   the run and not sent again, so a tab on a dead session costs one read rather than
-   one per poll. A read that cannot decide ends the wait with an error and takes
+1. **The confirm hook judges what it read.** The tab stays open on a session that
+   does not parse, is past the point `rhd` would renew it, or that Robinhood refuses,
+   until a new sign-in replaces it. `rhd` renews a minute before expiry, so in that
+   last minute a working access token may belong to a refresh token already rotated
+   away; storing it would replace the live session, so the hook goes by the renewal
+   rule (`Tokens::is_expired_at`), not the bare expiry. A refused token is remembered
+   for the run and not sent again, so a tab on a dead session costs one read rather
+   than one per poll. A read that cannot decide ends the wait with an error and takes
    nothing: a 429 or a 5xx whatever its body, or a success that is not the accounts
    list. An HTML page on any other status counts as a refusal; the tab stays open and
    that token is not sent again. `rhd` itself never renews from the window.
+2. **The page can still present the retired token.** When the window opens on an
+   expired access token, the web app may present its refresh token, which at best
+   signs it out and at worst ends the session `rhd` holds. The owner then signs in
+   again. cli-common has no way yet to clear site storage around a launch.
+   `--fresh-profile` avoids it for one run, and logout removes the copy.
 
 A confirmed capture is read twice: once by the hook, to decide whether the tab
 closes, and once after it, to decide whether anything is stored.
-
-A read that the rest of the capture then loses (Chrome dying between the read and
-the answer, Robinhood down when the hook asks) has already emptied the entry, so
-that sign-in is not retried from it; the next `--browser` asks for the password
-again.
 
 **A known device after the first sign-in — UNVERIFIED-LIVE.** A kept profile
 starts with no cookies only the first time, so that first `--browser` sign-in (and
@@ -436,8 +429,8 @@ close-on-capture above does not protect the copy):
 
 - that robinhood.com's sign-in completes in a kept-profile Chrome launched with
   a debug port, what a new device costs there, and what a known one saves (above);
-- that the web app starts signed out with `web:auth_state` removed, and that Chrome
-  writes the removal out before it stops (above);
+- what the web app does with an old `web:auth_state` when the window opens, and
+  whether it presents a retired refresh token (above);
 - that the `device_id` cookie is set by then, and whether `document.cookie`
   sees it (the bundle sets it from JavaScript; the jar read covers an
   `HttpOnly` one either way);

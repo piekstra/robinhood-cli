@@ -58,13 +58,11 @@ const DEVICE_COOKIE_URL: &str = "https://robinhood.com/";
 /// `device_token`, or `device_token: null` when `document.cookie` cannot see
 /// it: what the Console snippet in `--session-stdin`'s help copies.
 ///
-/// It takes `web:auth_state` out of `localStorage` as it reads, because the
-/// profile outlives the window. Refresh tokens rotate on every use, so a copy
-/// left there goes stale at `rhd`'s next renewal: the next window would hand it
-/// over, or the web app would present it and put the session `rhd` holds at
-/// risk. So the kept profile keeps the cookies (the `device_id` that remembers
-/// this device) and not the tokens, and the page starts signed out. The Console
-/// snippet stays read-only: it runs in the owner's own browser.
+/// It only reads, though the profile outlives the window. A removal from here is
+/// no guarantee: it may not reach the disk before Chrome stops, and the evaluation
+/// runs at least once, so it could also lose a session the capture never took.
+/// Whether what it reads is worth taking is the confirm hook's call
+/// (`commands::auth::confirm_candidate`).
 pub const SESSION_EXPRESSION: &str = "(() => { \
     const raw = localStorage['web:auth_state']; \
     if (!raw) return null; \
@@ -72,7 +70,6 @@ pub const SESSION_EXPRESSION: &str = "(() => { \
     try { s = JSON.parse(raw); if (typeof s === 'string') s = JSON.parse(s); } catch { return null; } \
     if (!s || !s.access_token) return null; \
     const d = (document.cookie.match(/(?:^|; )device_id=([^;]+)/) || [])[1]; \
-    localStorage.removeItem('web:auth_state'); \
     return JSON.stringify({ ...s, device_token: d || null }); \
 })()";
 
@@ -692,19 +689,13 @@ pub(crate) mod tests {
         assert!(SESSION_EXPRESSION.contains("device_token: d || null"));
     }
 
-    /// The kept profile must not hold the session afterwards, and nothing is
-    /// removed before the session is known to be there.
+    /// It only reads: a removal may not reach the disk, and the evaluation can
+    /// run more than once.
     #[test]
-    fn the_expression_takes_the_session_out_of_the_profile() {
-        let removal = format!("localStorage.removeItem('{AUTH_STATE_KEY}')");
-        let at = SESSION_EXPRESSION.find(&removal).expect("the removal");
-        assert!(
-            SESSION_EXPRESSION
-                .find("!s.access_token) return null")
-                .unwrap()
-                < at
-        );
-        assert_eq!(SESSION_EXPRESSION.matches("removeItem").count(), 1);
+    fn the_expression_only_reads() {
+        for write in ["removeItem", "setItem", ".clear("] {
+            assert!(!SESSION_EXPRESSION.contains(write), "{write}");
+        }
     }
 
     /// The jar's cookie fills the device the page could not read, and the

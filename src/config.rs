@@ -105,6 +105,15 @@ pub fn pending_key(profile: &str) -> String {
 }
 
 /// On-disk, non-secret settings.
+/// The login named by `--profile` or `$RHD_PROFILE`, if either does: what is known
+/// without the config.
+pub fn named_profile(flag: Option<&str>) -> Option<String> {
+    if let Some(p) = flag {
+        return Some(p.to_string());
+    }
+    std::env::var(PROFILE_ENV).ok().filter(|p| !p.is_empty())
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Profile used when neither `--profile` nor `$RHD_PROFILE` is given.
@@ -137,13 +146,8 @@ impl Config {
     /// type `--profile`, but the moment a second is added the name becomes
     /// load-bearing and [`Config::require_profile`] starts insisting on it.
     pub fn resolve_profile(&self, flag: Option<&str>) -> String {
-        if let Some(p) = flag {
-            return p.to_string();
-        }
-        if let Ok(p) = std::env::var(PROFILE_ENV) {
-            if !p.is_empty() {
-                return p;
-            }
+        if let Some(p) = named_profile(flag) {
+            return p;
         }
         if let Some(p) = &self.default_profile {
             return p.clone();

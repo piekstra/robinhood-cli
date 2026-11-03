@@ -144,15 +144,17 @@ not cover the history, the HTTP cache or site storage, so `0700` is their only
 protection. The directory sits where ordinary user-level backups usually look, so
 exclude it from any backup you don't want holding this.
 
-**The session's tokens are taken out of it.** The web app keeps its access and
-refresh tokens in `localStorage`'s `web:auth_state`, which Chrome does not encrypt.
-The capture removes that entry as it reads it, so after a completed sign-in the
-profile holds no copy, and a refresh token that `rhd` later rotates is not left
-where the next window would present it. Two cases can still leave it there, until
-the next sign-in or logout: a sign-in that ended before the read, and a Chrome
-stopped before the removal reached the disk. The capture then refuses anything past
-the point `rhd` would renew it, or that Robinhood does not accept. A throttle or an
-outage during that check ends the wait with an error, and takes nothing.
+**The session's tokens stay in it.** The web app keeps its access and refresh
+tokens in `localStorage`'s `web:auth_state`, which Chrome does not encrypt, so `0700`
+is all that protects that copy of a live refresh token. The capture only reads: a
+removal from the page may not reach the disk before Chrome stops, and the evaluation
+can run more than once. Once `rhd` renews, the copy is retired, and the next window
+can present it, which at best signs it out and at worst ends the session in the
+keychain; you then sign in again. cli-common has no way yet to clear site storage
+around a launch. `--fresh-profile` avoids this for one run, and logout removes the
+copy. The capture refuses anything past the point `rhd` would renew it, or that
+Robinhood does not accept. A throttle or an outage during that check ends the wait
+with an error, and takes nothing.
 
 **The profile outlives a failed sign-in.** However a sign-in fails once its window
 has opened (a timeout, a closed window, Ctrl-C, Robinhood throttled or down during

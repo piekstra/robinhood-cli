@@ -152,9 +152,13 @@ enum AuthCmd {
     Login(RhLoginArgs),
     /// Report credential/session state (auth-status/v1).
     Status(StatusArgs),
-    /// Clear the cached session, then remove the kept browser profile; --forget
-    /// also removes stored credentials. While Chrome is using the profile this
-    /// exits 1 with the rest already cleared and only the profile left.
+    /// Clear the session and remove the kept browser profile.
+    ///
+    /// --forget also removes stored credentials and this login's config entry.
+    /// Every step is attempted even after one fails; then this says what is cleared
+    /// and what remains, and exits with the first failure's code. While Chrome is
+    /// using the kept profile that is exit 1, with the rest already cleared. The
+    /// config entry goes last, only once the rest is clear, so a retry finds it.
     Logout(LogoutArgs),
     /// Raw keychain write for rotation / headless setup.
     SetCredential(SetCredentialArgs),
@@ -237,11 +241,11 @@ stores it in the OS keychain only if that read succeeds. It never prints
 the token.
 
 The kept profile lets Robinhood remember this device, so a later sign-in
-often asks for less. rhd takes the session out of it, but it is a full
-Chrome profile, owner-only on disk: Robinhood's cookies, browsing history
-with full URLs, the HTTP cache and site storage stay, after a failed sign-in
-too, until `rhd auth logout` removes it. --fresh-profile signs in through a
-scratch profile instead.
+often asks for less. It is a full Chrome profile, owner-only on disk:
+Robinhood's cookies, the session's tokens, browsing history with full URLs,
+the HTTP cache and site storage stay, after a failed sign-in too, until
+`rhd auth logout` removes it. --fresh-profile signs in through a scratch
+profile instead.
 
 Waits up to 10 minutes; Ctrl-C cancels. Chrome, Chromium or Edge is found
 at the standard install paths; set RHD_CHROME to use another binary.
@@ -312,8 +316,11 @@ enum ProfilesCmd {
         #[arg(long, value_name = "ID")]
         account: Option<String>,
     },
-    /// Remove a login profile, its stored credentials and its kept browser
-    /// profile.
+    /// Remove a login profile, its credentials and its kept browser profile.
+    ///
+    /// Every step is attempted even after one fails; then this says what is cleared
+    /// and what remains, and exits with the first failure's code. The config entry
+    /// goes last, only once the rest is clear, so a retry finds it.
     Remove {
         name: String,
         /// Remove without confirmation.
@@ -567,6 +574,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
     }
 
     let store = ConfigStore::new(BIN).with_override(cli.config.clone());
+    if let Command::Auth(AuthCmd::Logout(args)) = &cli.command {
+        return auth_logout(cli, &store, args);
+    }
     let cfg: Config = store.load()?;
 
     match &cli.command {
@@ -757,6 +767,24 @@ fn validate(command: &Command) -> Result<(), CliError> {
     }
 }
 
+/// `auth logout`, which a config that cannot be parsed must not stop: every step
+/// but the config entry needs only the login's name. Without `--profile` or
+/// `$RHD_PROFILE` the name is in that file, and this does not guess: the default
+/// name could log out the wrong login, or none, and say it had.
+fn auth_logout(cli: &Cli, store: &ConfigStore, args: &LogoutArgs) -> Result<(), CliError> {
+    let cfg: Result<Config, CliError> = store.load();
+    let profile = match &cfg {
+        Ok(cfg) => cfg.require_profile(cli.profile.as_deref())?,
+        Err(e) => config::named_profile(cli.profile.as_deref()).ok_or_else(|| {
+            CliError::Other(format!(
+                "{e}. That file says which login to log out, so nothing is cleared yet: name it \
+                 with `rhd auth logout --profile <NAME>`"
+            ))
+        })?,
+    };
+    commands::auth::logout(&cli.common, store, cfg, &profile, args.forget)
+}
+
 fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Result<(), CliError> {
     let profile = cfg.require_profile(cli.profile.as_deref())?;
     match cmd {
@@ -791,9 +819,7 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore, cfg: Config) -> Resul
             cli.account.as_deref(),
             args.verify,
         ),
-        AuthCmd::Logout(args) => {
-            commands::auth::logout(&cli.common, store, cfg, &profile, args.forget)
-        }
+        AuthCmd::Logout(_) => unreachable!("served before the config is loaded"),
         AuthCmd::SetCredential(args) => {
             commands::auth::set_credential(&cli.common, store, cfg, &profile, args)
         }

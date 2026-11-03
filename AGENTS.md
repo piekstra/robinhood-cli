@@ -199,15 +199,14 @@ and a rate-limited one.
   It needs the owner at the window: never run it unattended or from a test.
 - **The kept browser profile.** `Launch::profile_name(<login>)` keeps one per
   login profile, so one household account's sign-in never opens signed in as
-  another, and `--fresh-profile` opts out for one run. A retired refresh token
-  must never stay where the next window reads or presents it, so
-  `capture::SESSION_EXPRESSION` takes `web:auth_state` out of `localStorage` as it
-  reads, and `commands::auth::confirm_candidate` lets the tab close only on a
-  session short of `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood
-  accepts.
-  Keep both gates: without them a re-login reads the old session, closes the window
-  and fails, run after run. The Console snippet stays read-only: it runs in the
-  owner's own browser.
+  another, and `--fresh-profile` opts out for one run. The session's tokens stay in
+  it, and refresh tokens rotate on every use. So `commands::auth::confirm_candidate`
+  lets the tab close only on a session short of `rhd`'s renewal point
+  (`Tokens::is_expired_at`) that Robinhood accepts. Keep that gate: without it a
+  re-login reads the old session, closes the window and fails, run after run.
+  `capture::SESSION_EXPRESSION` and the Console snippet only read. Do not add a
+  removal to the expression: it may not reach the disk, and the evaluation can run
+  more than once. Clearing site storage around a launch belongs to cli-common.
 - **It is a full Chrome profile** (history with full URLs, HTTP cache, site
   storage), `0700` its only protection beyond Chrome's cookie encryption, which on
   Linux with no desktop keyring uses a fixed, publicly known key. It outlives a
@@ -221,9 +220,14 @@ and a rate-limited one.
   test may reach the real one.** The removal goes through the `logout_browser` seam:
   the binary binds `forget_named_profile(BIN, name)`, tests bind
   `forget_named_profile_in` under a temp dir (`pk-cli-browser`'s `test-util`, a
-  dev-dependency only). It runs after the keychain and before the config entry, so a
-  refusal (`ProfileInUse`, `Profile`; exit 1) leaves the credentials cleared and the
-  retry able to find the login, and its error says so (`logout_refused`).
+  dev-dependency only). Every step is attempted even after one fails, so a keychain
+  failure does not leave the profile behind, and the error says what is cleared and
+  what remains, built from the inner messages, with the first failure's exit code
+  (`TeardownSteps`). The config entry is the one exception: it goes last, only once
+  the rest is clear, because `Config::require_profile` refuses an unconfigured name
+  and the retry must find it. `auth logout` loads the config itself (`auth_logout`):
+  one that cannot be parsed stops no step when `--profile` or `RHD_PROFILE` names the
+  login, and without a name it refuses rather than guess.
   `--session-stdin` is the fallback (a session copied out of DevTools), and
   goes through the same parser, proof and keychain item. Either bundle
   carries its own `origin` and the browser's `device_token`, and renews with
