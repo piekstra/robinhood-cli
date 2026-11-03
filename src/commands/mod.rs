@@ -363,8 +363,11 @@ mod tests {
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().ends_with(&blocked), "{err}");
 
-        let password = renewal_error(CliError::Auth("dummy refusal".into()), false, "dummy-one");
-        assert!(!password.to_string().contains("--overwrite"), "{password}");
+        let not_browser = renewal_error(CliError::Auth("dummy refusal".into()), false, "dummy-one");
+        assert!(
+            !not_browser.to_string().contains("--overwrite"),
+            "{not_browser}"
+        );
 
         let down = renewal_error(CliError::Upstream("dummy outage".into()), true, "dummy-one");
         assert_eq!(down.exit_code(), 5);
