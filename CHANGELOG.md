@@ -3,7 +3,7 @@
 ## v0.5.0 — 2026-11-03
 
 A browser sign-in now runs in a profile `rhd` keeps per login, where it used to run
-in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
+in a scratch profile deleted after every sign-in. Moves to cli-common v0.20.0.
 
 - `rhd auth login --browser` keeps a Chrome profile on disk for each login profile,
   owner-only (`0700`), at
