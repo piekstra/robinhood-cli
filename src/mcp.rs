@@ -73,10 +73,10 @@ pub trait Source {
 
 /// The live API, through the same [`Ctx`] the commands use.
 ///
-/// One context, one read at a time: a lapsed access token is refreshed
-/// inside `Ctx::access_token`, which rotates the stored refresh token, and
-/// two calls refreshing at once would present the same one twice. The
-/// shared client also keeps its request pacing across calls.
+/// One context, one read at a time: the shared client keeps its request
+/// pacing across calls. A lapsed access token is refreshed inside
+/// `Ctx::access_token`, which rotates the stored refresh token, under a lock
+/// that also holds off every other `rhd` process.
 pub struct LiveSource {
     ctx: Mutex<Ctx>,
 }

@@ -18,6 +18,7 @@ pub mod profiles;
 pub mod transactions;
 pub mod transfers;
 
+use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_core::{output, CliError, CommonArgs, Money};
 use pk_cli_secrets::CredentialStore;
 use serde::Serialize;
@@ -235,21 +236,39 @@ impl Ctx {
         if !tokens.is_expired() {
             return Ok(tokens.access_token);
         }
-        let Some(refresh) = tokens.refresh_token.as_deref() else {
-            return Err(CliError::Auth(match tokens.origin {
-                Origin::Bearer => format!(
-                    "the browser session imported into `{p}` has expired — a bare bearer token \
-                     cannot be renewed; sign in again with `rhd auth login --browser --profile \
-                     {p}`, which stores the renewable web:auth_state shape",
-                    p = self.profile
-                ),
-                _ => format!(
-                    "the cached session for `{p}` expired and carries no refresh token — run \
-                     `rhd auth login --browser --profile {p}`",
-                    p = self.profile
-                ),
-            }));
-        };
+        if tokens.refresh_token.is_none() {
+            return Err(self.not_renewable(&tokens));
+        }
+        let token_key = config::token_key(&self.profile);
+        let fresh = renew_session(
+            &RefreshLock::for_binary(config::BIN)?,
+            || self.tokens(),
+            |stored| self.not_renewable(stored),
+            |stored, refresh| self.grant(stored, refresh),
+            |fresh| self.creds.set(&token_key, &fresh.to_secret()),
+        )?;
+        Ok(fresh.access_token)
+    }
+
+    /// Why an expired session cannot be renewed: it holds no refresh token.
+    fn not_renewable(&self, tokens: &Tokens) -> CliError {
+        CliError::Auth(match tokens.origin {
+            Origin::Bearer => format!(
+                "the browser session imported into `{p}` has expired — a bare bearer token \
+                 cannot be renewed; sign in again with `rhd auth login --browser --profile \
+                 {p}`, which stores the renewable web:auth_state shape",
+                p = self.profile
+            ),
+            _ => format!(
+                "the cached session for `{p}` expired and carries no refresh token — run \
+                 `rhd auth login --browser --profile {p}`",
+                p = self.profile
+            ),
+        })
+    }
+
+    /// Spend `refresh`, the session's refresh token, for a new bundle.
+    fn grant(&self, tokens: &Tokens, refresh: &str) -> Result<Tokens, CliError> {
         // Only a password session renews with the profile's device token, so
         // an imported one never reads that keychain item at all.
         let profile_device = if tokens.origin.is_password() {
@@ -259,7 +278,7 @@ impl Ctx {
         } else {
             None
         };
-        let fresh = self
+        Ok(self
             .rh
             .refresh(refresh, tokens.refresh_device(profile_device.as_deref()))
             .map_err(|e| match e {
@@ -270,10 +289,7 @@ impl Ctx {
                 )),
                 other => other,
             })?
-            .renewed(&tokens);
-        self.creds
-            .set(&config::token_key(&self.profile), &fresh.to_secret())?;
-        Ok(fresh.access_token)
+            .renewed(tokens))
     }
 
     /// The account number to act on, or a usage error naming how to pick one.
@@ -285,5 +301,190 @@ impl Ctx {
                     .into(),
             )
         })
+    }
+}
+
+/// One renewal, safe against every other `rhd` process: the long-running
+/// `mcp --http` server, a stdio server, a command in a terminal. They share one
+/// refresh token, which rotates on every use (docs/api.md §2.5), and a process
+/// that presents a retired one loses the session, which costs the owner a
+/// sign-in. So the session is read again under the lock, and one no longer
+/// expired means another process renewed while this one waited: no grant.
+fn renew_session(
+    lock: &RefreshLock,
+    read: impl FnOnce() -> Result<Tokens, CliError>,
+    not_renewable: impl FnOnce(&Tokens) -> CliError,
+    grant: impl FnOnce(&Tokens, &str) -> Result<Tokens, CliError>,
+    store: impl FnOnce(&Tokens) -> Result<(), CliError>,
+) -> Result<Tokens, CliError> {
+    lock.renew(read, Tokens::is_expired, |stored| {
+        let Some(refresh) = stored.refresh_token.as_deref() else {
+            return Err(not_renewable(&stored));
+        };
+        let fresh = grant(&stored, refresh)?;
+        store(&fresh)?;
+        Ok(fresh)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::Duration;
+
+    fn session(refresh: Option<&str>, expires_at: u64) -> Tokens {
+        Tokens {
+            access_token: "dummy-access".into(),
+            refresh_token: refresh.map(String::from),
+            expires_at: Some(expires_at),
+            read_only_token: None,
+            origin: Origin::WebAuthState,
+            device_token: None,
+        }
+    }
+
+    fn expired(refresh: &str) -> Tokens {
+        session(Some(refresh), 1)
+    }
+
+    fn live(refresh: &str) -> Tokens {
+        session(Some(refresh), crate::client::now_unix() + 3600)
+    }
+
+    fn not_renewable(_: &Tokens) -> CliError {
+        CliError::Auth("dummy: cannot be renewed".into())
+    }
+
+    /// Two processes' worth of contenders: each has its own open of the lock
+    /// file, which is what contends, and both saw the same session expired.
+    /// Offline, with the keychain and the token endpoint stood in for.
+    #[test]
+    fn two_contenders_post_one_grant_and_both_use_its_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token-refresh.lock");
+        let stored = Arc::new(Mutex::new(expired("dummy-refresh-1")));
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let start = Arc::new(Barrier::new(2));
+        let contenders: Vec<_> = (0..2)
+            .map(|_| {
+                let (path, stored, grants, start) = (
+                    path.clone(),
+                    Arc::clone(&stored),
+                    Arc::clone(&grants),
+                    Arc::clone(&start),
+                );
+                std::thread::spawn(move || {
+                    start.wait();
+                    renew_session(
+                        &RefreshLock::at(path),
+                        || Ok(stored.lock().unwrap().clone()),
+                        not_renewable,
+                        |_, refresh| {
+                            grants.lock().unwrap().push(refresh.to_string());
+                            std::thread::sleep(Duration::from_millis(100));
+                            Ok(live("dummy-refresh-2"))
+                        },
+                        |fresh| {
+                            *stored.lock().unwrap() = fresh.clone();
+                            Ok(())
+                        },
+                    )
+                })
+            })
+            .collect();
+        for contender in contenders {
+            let session = contender.join().unwrap().unwrap();
+            assert_eq!(session.refresh_token.as_deref(), Some("dummy-refresh-2"));
+        }
+        assert_eq!(*grants.lock().unwrap(), ["dummy-refresh-1"]);
+    }
+
+    #[test]
+    fn a_session_no_longer_expired_skips_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = renew_session(
+            &RefreshLock::at(dir.path().join("token-refresh.lock")),
+            || Ok(live("dummy-refresh-2")),
+            not_renewable,
+            |_, _| panic!("another process renewed: no grant"),
+            |_| panic!("nothing new to store"),
+        )
+        .unwrap();
+        assert_eq!(session.refresh_token.as_deref(), Some("dummy-refresh-2"));
+    }
+
+    #[test]
+    fn the_grant_presents_the_token_read_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = Mutex::new(None);
+        let fresh = renew_session(
+            &RefreshLock::at(dir.path().join("token-refresh.lock")),
+            || Ok(expired("dummy-refresh-newest")),
+            not_renewable,
+            |_, refresh| {
+                assert_eq!(refresh, "dummy-refresh-newest");
+                Ok(live("dummy-refresh-next"))
+            },
+            |fresh| {
+                *stored.lock().unwrap() = Some(fresh.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.refresh_token.as_deref(), Some("dummy-refresh-next"));
+        let stored = stored.lock().unwrap();
+        assert_eq!(
+            stored.as_ref().unwrap().refresh_token.as_deref(),
+            Some("dummy-refresh-next")
+        );
+    }
+
+    #[test]
+    fn an_expired_session_replaced_by_one_with_no_refresh_token_posts_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = renew_session(
+            &RefreshLock::at(dir.path().join("token-refresh.lock")),
+            || Ok(session(None, 1)),
+            not_renewable,
+            |_, _| panic!("no refresh token: no grant"),
+            |_| panic!("nothing to store"),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn a_logout_while_waiting_is_an_auth_error_and_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = renew_session(
+            &RefreshLock::at(dir.path().join("token-refresh.lock")),
+            || Err(CliError::Auth("dummy: no cached session".into())),
+            not_renewable,
+            |_, _| panic!("logged out: no grant"),
+            |_| panic!("logged out: nothing to store"),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn a_held_lock_is_a_bounded_error_and_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token-refresh.lock");
+        RefreshLock::at(&path)
+            .hold(|| {
+                let err = renew_session(
+                    &RefreshLock::at(&path).wait_at_most(Duration::from_millis(100)),
+                    || panic!("no read without the lock"),
+                    not_renewable,
+                    |_, _| panic!("no grant without the lock"),
+                    |_| panic!("nothing to store"),
+                )
+                .unwrap_err();
+                assert!(err.to_string().contains("try again"), "{err}");
+                Ok(())
+            })
+            .unwrap();
     }
 }

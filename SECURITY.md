@@ -11,8 +11,9 @@ rather than a public issue.
 `rhd` authenticates to Robinhood's **unofficial, community-documented** API on
 behalf of one household and reads their brokerage data. It supports several
 independent logins ("profiles"), so a leak affects more than one person's
-finances. The things worth protecting, all stored in the OS keychain under
-service `piekstra.rhd` and namespaced per profile:
+finances. The things worth protecting, stored in the OS keychain under
+service `piekstra.rhd` and, except for the `--http` bearer token, namespaced
+per profile:
 
 - **The account password** (`<profile>/password`). Read at point of use, never
   logged, never placed on argv, never written to disk.
@@ -40,6 +41,17 @@ service `piekstra.rhd` and namespaced per profile:
 - **A parked mid-challenge login** (`<profile>/pending`). Short-lived and
   single-use: deleted on the next `--code` attempt whether it succeeds or
   fails.
+- **The `--http` bearer token**, only if you use `rhd mcp --http` (below). It
+  is not per profile: the keychain item `mcp-http-token`, or `RHD_MCP_TOKEN`,
+  with **a copy in your Cloudflare Worker** as its `HOME_ROBINHOOD_TOKEN`
+  secret. It admits a caller to the read-only tools on 127.0.0.1 and signs in
+  to nothing at Robinhood.
+
+One file sits beside them and holds nothing: `~/.config/rhd/token-refresh.lock`
+is empty, and `rhd` processes hold it while renewing a session, so two never
+present one refresh token. That holds once every copy sharing the keychain items
+is 0.4.2 or later, including a server not yet restarted and an installed Claude
+Desktop extension, which bundles its own binary.
 
 Additionally, **document URLs returned by the API are pre-signed** and grant
 access to a tax form or statement without a bearer token. Never paste one into
@@ -53,8 +65,9 @@ an issue, a log, or a commit.
 - It talks only to `api.robinhood.com`, `bonfire.robinhood.com` (ACATS
   transfers) and the pre-signed document hosts the API returns, plus, during
   `auth login --browser`, the local Chrome it launched (over its loopback
-  DevTools port), in which the owner signs in to robinhood.com. No telemetry,
-  no third-party services.
+  DevTools port), in which the owner signs in to robinhood.com. No telemetry
+  and no third-party services, unless you run `rhd mcp --http`, whose tool
+  results reach Cloudflare and Claude (below).
 - It hardcodes no secrets. `gitleaks` runs in CI over the full history.
 
 ## The MCP server
@@ -83,6 +96,13 @@ the read-only tools are served (all three are). The session stays in the
 keychain: the Worker sends tool calls and receives results, and never sees
 a cookie or a token for Robinhood.
 
+**Tool results leave your computer on this path.** They hold your financial
+data (balances, positions, trades, dividends, the list of your tax documents).
+They cross Cloudflare, through your tunnel and your Worker, and reach Claude,
+which shows them in your conversation. Who holds what, and what a leaked token
+can do, is in the connector's
+[threat model](https://github.com/piekstra/cli-common/blob/main/connector/README.md#threat-model).
+
 ## Unofficial-API risk
 
 Robinhood publishes no public retail API and its terms discourage automated
@@ -110,3 +130,26 @@ $ op read 'op://Private/robinhood/password' \
 `rhd auth logout --forget` removes that profile's password, token bundle,
 device token, and any parked login from the keychain, and drops the profile
 from the config.
+
+## Revoking access
+
+`rhd auth logout` removes this machine's copy of the session; to end it at
+Robinhood, change your password or sign out of other devices in Robinhood's own
+app. The delete runs even when the refresh lock is unavailable. If another process
+has held the lock past the wait, `rhd auth logout` and `rhd profiles remove` delete
+the session and exit 5 saying so, because a renewal in flight can store it again.
+Run the command again in a minute to settle it.
+
+`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`. The
+server stays up, its callers get auth errors, and **a later login silently
+restores the token holder's access**. Revoke that access separately:
+
+- **Invalidate the token:** `rhd mcp --new-token --overwrite`, then restart the
+  server (`launchctl kickstart -k gui/$(id -u)/com.piekstra.rhd-mcp-http`). The
+  old token works until the restart. A server that takes its token from
+  `RHD_MCP_TOKEN` needs the variable changed instead. To keep using the
+  connector, put the new value in the Worker's `HOME_ROBINHOOD_TOKEN`.
+- **Remove the path:** stop the launchd agent
+  (`launchctl bootout gui/$(id -u)/com.piekstra.rhd-mcp-http`) and the tunnel,
+  and delete the tunnel and VPC service
+  ([removing it](https://github.com/piekstra/cli-common/blob/main/connector/README.md#updating-rotating-and-removing)).

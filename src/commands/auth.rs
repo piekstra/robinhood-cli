@@ -15,6 +15,7 @@
 //!   can't fetch anything leaves nothing broken behind. That holds for a
 //!   session from a browser (`--browser`, `--session-stdin`) too.
 
+use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
 use pk_cli_browser::{BrowserError, Launch};
 use pk_cli_config::ConfigStore;
@@ -48,6 +49,8 @@ pub fn login(
     let rh = Rh::new()?;
 
     let username = resolve_username(&cfg, profile, input, common)?;
+    // Before anything is spent: an approval or a code cannot be had twice.
+    RefreshLock::for_binary(config::BIN)?.before_signin()?;
     let password = resolve_password(&creds, profile, input, common)?;
 
     // A code (or an explicit --resume) belongs to the attempt that raised the
@@ -186,11 +189,13 @@ fn finish(
         None,
     )?;
 
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    // The device token first: it needs no lock, and it is what keeps the next
+    // attempt from presenting as a new device if the session cannot be stored.
     creds.set(
         &config::device_key(profile),
         &Secret::new(device_token.to_string()),
     )?;
+    store_session(creds, profile, &tokens)?;
 
     // `paginate` walked every page, so the listing is the whole login.
     record_profile(store, cfg, profile, Some(username), &accounts, true)?;
@@ -264,6 +269,8 @@ pub fn browser_login(
     cfg: Config,
     profile: &str,
 ) -> Result<(), CliError> {
+    // Before the window: a sign-in the owner has finished is not thrown away.
+    RefreshLock::for_binary(config::BIN)?.before_signin()?;
     let captured = pk_cli_browser::capture(
         Launch::new(config::BIN)
             .url(capture::LOGIN_URL)
@@ -305,6 +312,9 @@ pub fn import_session(
     profile: &str,
     non_interactive: bool,
 ) -> Result<(), CliError> {
+    // Before the read: a session piped in once cannot be read again. It does not
+    // wait on a busy lock, so bad input still fails at once; the store waits.
+    RefreshLock::for_binary(config::BIN)?.try_hold(|| Ok(()))?;
     let raw = read_capture(common, non_interactive)?;
     import(common, store, cfg, profile, &raw, Source::Stdin)
 }
@@ -348,7 +358,7 @@ fn import(
     })?;
 
     let creds = CredentialStore::for_binary(config::BIN);
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    store_session(&creds, profile, &tokens)?;
     // A captured session names no username; the proving read was one page.
     record_profile(store, &mut cfg, profile, None, &visible, !more)?;
 
@@ -558,6 +568,21 @@ pub fn status(
     Ok(())
 }
 
+/// Store a session a login obtained, under the lock a renewal holds, so a
+/// renewal in flight cannot overwrite it with the old session's tokens.
+fn store_session(creds: &CredentialStore, profile: &str, tokens: &Tokens) -> Result<(), CliError> {
+    RefreshLock::for_binary(config::BIN)?
+        .store_signin(|| creds.set(&config::token_key(profile), &tokens.to_secret()))
+}
+
+/// Delete a profile's session, under the lock a renewal holds if it can be had,
+/// so a renewal in flight cannot store it again after. The delete runs either
+/// way: the lock must not keep a credential on the machine.
+pub(crate) fn forget_session(creds: &CredentialStore, profile: &str) -> Result<(), CliError> {
+    RefreshLock::forget_for_binary(config::BIN, || creds.delete(&config::token_key(profile)))
+        .map(|_| ())
+}
+
 pub fn logout(
     common: &CommonArgs,
     store: &ConfigStore,
@@ -569,8 +594,8 @@ pub fn logout(
 
     // The cached session and any half-finished login always go; `logout`
     // that leaves a resumable attempt behind isn't a logout.
-    creds.delete(&config::token_key(profile))?;
     creds.delete(&config::pending_key(profile))?;
+    forget_session(&creds, profile)?;
 
     if forget {
         creds.delete(&config::password_key(profile))?;
