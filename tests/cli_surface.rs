@@ -250,7 +250,8 @@ fn fresh_profile_needs_the_browser_flag() {
             .args(extra)
             .write_stdin("Bearer SAMPLE-ACCESS-TOKEN-NOT-A-REAL-CREDENTIAL")
             .assert()
-            .code(2);
+            .code(2)
+            .stderr(contains("--fresh-profile"));
     }
 }
 

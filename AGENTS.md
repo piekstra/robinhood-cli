@@ -46,7 +46,7 @@ documented** API (`api.robinhood.com`). It exists to feed tax work:
 
 Conforms to `piekstra-cli/1` (see `~/Dev/cli-common/DESIGN.md` and
 `conformance.md`). Shared behavior comes from the `pk-cli-*` crates, every one
-pinned to the same cli-common tag (`tag = "v0.18.0"`) — reuse before writing (dates,
+pinned to the same cli-common tag (`tag = "v0.19.0"`) — reuse before writing (dates,
 output, `RangeArgs`, `Paged`, keychain, config, self-update, the
 `documents/v1` DTOs and its `verify`/`fs_safe` download hygiene, and the
 browser sign-in behind `auth login --browser`).
@@ -210,20 +210,22 @@ and a rate-limited one.
   It needs the owner at the window: never run it unattended or from a test.
 - **The kept browser profile.** `Launch::profile_name(<login>)` keeps one per
   login profile, so one household account's sign-in never opens signed in as
-  another, and `--fresh-profile` opts out for one run. The session's tokens stay in
-  it, and refresh tokens rotate on every use. So `commands::auth::confirm_candidate`
-  lets the tab close only on a session short of `rhd`'s renewal point
-  (`Tokens::is_expired_at`) that Robinhood accepts. Keep that gate: without it a
-  re-login reads the old session, closes the window and fails, run after run.
+  another, and `--fresh-profile` opts out for one run. `commands::auth::browser_launch`
+  turns on `clear_site_storage`: the page keeps the session's tokens in `localStorage`,
+  and refresh tokens rotate on every use. Keep it on.
+  `commands::auth::confirm_candidate` lets the tab close only on a session short of
+  `rhd`'s renewal point (`Tokens::is_expired_at`) that Robinhood accepts.
   `capture::SESSION_EXPRESSION` and the Console snippet only read. Do not add a
-  removal to the expression: it may not reach the disk, and the evaluation can run
-  more than once. Clearing site storage around a launch belongs to cli-common.
-- **It is a full Chrome profile** (history with full URLs, HTTP cache, site
-  storage), `0700` its only protection beyond Chrome's cookie encryption, which on
+  removal to the expression: the evaluation can run more than once, and clearing site
+  storage belongs to cli-common.
+- **It is a full Chrome profile** (cookies, history with full URLs, HTTP cache),
+  `0700` its only protection beyond Chrome's cookie encryption, which on
   Linux with no desktop keyring uses a fixed, publicly known key. It outlives a
   failed sign-in, so every failure from the window on says so: they all pass through
   `through_the_window` into `failed_sign_in`, so add a new step there. `auth status`
-  does not report it: cli-common has no public way to ask whether one exists.
+  reports the active login's as `browser_profile` through `browser_profile_status`,
+  whose tests fill the seam with `named_profile_exists_in`. It says a profile is kept,
+  not that anything is signed in there.
 - **A read that cannot decide ends the wait.** In `confirm_candidate` a 429 or a
   5xx is `Confirm::Fail`, whatever its body (`client::classify` reads those statuses
   before the HTML), and only an accounts list is `Ready`.

@@ -3,7 +3,7 @@
 ## v0.5.0 — 2026-11-03
 
 A browser sign-in now runs in a profile `rhd` keeps per login, where it used to run
-in a scratch profile deleted after every sign-in.
+in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
 
 - `rhd auth login --browser` keeps a Chrome profile on disk for each login profile,
   owner-only (`0700`), at
@@ -12,10 +12,9 @@ in a scratch profile deleted after every sign-in.
   carry over and a later sign-in often asks for less, and one household account's
   sign-in never opens signed in as another. Other systems still use a scratch
   profile every time.
-- The trade: it is a full Chrome profile, so it also holds a copy of the session's
-  access and refresh tokens, browsing history with full URLs, query strings included,
-  the HTTP cache and site storage. Chrome's cookie encryption does not cover those;
-  `0700` is their only protection, and ordinary backups usually include the directory.
+- The trade: it is a full Chrome profile, so it also holds browsing history with full
+  URLs, query strings included, and the HTTP cache. Chrome's cookie encryption does
+  not cover those; `0700` is their only protection, and ordinary backups usually include the directory.
   On Linux with no desktop keyring Chrome encrypts the cookies with a fixed, publicly
   known key, so there the session cookie has only `0700` too. SECURITY.md has the
   details.
@@ -31,17 +30,18 @@ in a scratch profile deleted after every sign-in.
   for one.
 - Every failure once the window has opened now says the kept profile stays and that
   `rhd auth logout` removes it: a timeout, a closed window, Ctrl-C, Robinhood
-  throttled or down during the check, a keychain write that fails. `rhd auth status`
-  does not report the profile: cli-common has no public way to ask whether one
-  exists.
+  throttled or down during the check, a keychain write that fails.
+- `rhd auth status` reports whether the active login keeps a profile (`browser_profile`
+  with `--json`, a `Browser:` line otherwise), not whether anything is signed in there.
 - A login whose name a Chrome profile cannot carry (anything but 1 to 64 ASCII
   letters, digits, `-` or `_`) is refused by `--browser`, exit 2, before Chrome
   starts, and never mapped onto another login's profile. `--browser --fresh-profile`
   still signs it in, and reads and logout work as before. `rhd profiles add` now
   also refuses a name over 64 characters.
-- The capture only reads, so the copy of the tokens in `web:auth_state` goes stale at
-  `rhd`'s next renewal, and the next window can present it. You then sign in again.
-  `--fresh-profile` avoids it for one run, and logout removes the copy.
+- The profile keeps no tokens between runs. Its site storage, where the web app holds
+  them in `web:auth_state`, is removed before Chrome starts and again once Chrome has
+  stopped; after a crash or a second Ctrl-C, the next launch removes it. Its cookies
+  stay, and Chrome now quits over its debug port, so a fresh one reaches the disk.
 - The capture now takes a session only once it is short of `rhd`'s renewal point and
   Robinhood accepts it. A token Robinhood refused is not sent again. A throttle or an
   outage during that check ends the wait with an error.

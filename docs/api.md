@@ -330,8 +330,15 @@ too. Its `device_id` cookie carries over (the web sets it for 10 years), so a la
 sign-in presents a device Robinhood has seen. `--fresh-profile` uses a scratch
 profile for one run instead. `auth logout` and `profiles remove` remove that login's
 as their browser step, and name refusals (a sign-in or a Chrome using it, a symlink,
-another user's) as exit 1, saying what is already cleared and how to finish.
-SECURITY.md lists what the profile holds.
+another user's) as exit 1, saying what is already cleared and how to finish. Chrome
+is asked to quit over its debug port, so a cookie Robinhood sets just before the close
+reaches the disk; cli-common measured that in headless Chrome, not in a visible
+window. SECURITY.md lists what the profile holds.
+
+`auth status` reports on the login it resolves to, as `browser_profile`: whether a
+profile is kept for it, not whether anything is signed in there. A name a Chrome
+profile cannot carry reports `false`, and a path that needs repair leaves the field
+out with a warning.
 
 A name a Chrome profile cannot carry (anything but 1 to 64 ASCII letters, digits,
 `-` or `_`) is checked and never rewritten, so it can never land on another login's
@@ -341,27 +348,29 @@ it, exit 2, before Chrome starts; `--browser --fresh-profile` signs it in, since
 scratch profile needs no name; and its logout finishes, since it never had a
 profile to remove.
 
-**The tokens stay too.** A kept profile starts each window with the last sign-in's
-`web:auth_state`: an access token that has often expired and a refresh token `rhd`
-has rotated away. The expression only reads: a removal from the page may not reach
-the disk before Chrome stops, and the evaluation can run more than once. So:
+**The tokens do not stay.** A `web:auth_state` left in the profile would start the
+next window on an access token that has often expired and a refresh token `rhd` has
+rotated away, and the web app could present it, which at best signs it out and at
+worst ends the session `rhd` holds. So the launch sets `clear_site_storage(true)`,
+which keeps the cookies and removes `Default/Local Storage`, `Session Storage`,
+`IndexedDB` and the rest of the site storage twice: before Chrome starts, where a
+failure refuses the launch (exit 1, no Chrome), and again once Chrome has stopped. A
+crash or a second Ctrl-C skips the second removal, as does a Chrome still running in
+the profile; the tokens then stay on disk, `0700` their only protection, until the
+next launch or logout. Each window therefore opens with no session in the page. The
+expression only reads: the evaluation can run more than once, so a removal could lose
+a session the capture never took.
 
-1. **The confirm hook judges what it read.** The tab stays open on a session that
-   does not parse, is past the point `rhd` would renew it, or that Robinhood refuses,
-   until a new sign-in replaces it. `rhd` renews a minute before expiry, so in that
-   last minute a working access token may belong to a refresh token already rotated
-   away; storing it would replace the live session, so the hook goes by the renewal
-   rule (`Tokens::is_expired_at`), not the bare expiry. A refused token is remembered
-   for the run and not sent again, so a tab on a dead session costs one read rather
-   than one per poll. A read that cannot decide ends the wait with an error and takes
-   nothing: a 429 or a 5xx whatever its body, or a success that is not the accounts
-   list. An HTML page on any other status counts as a refusal; the tab stays open and
-   that token is not sent again. `rhd` itself never renews from the window.
-2. **The page can still present the retired token.** When the window opens on an
-   expired access token, the web app may present its refresh token, which at best
-   signs it out and at worst ends the session `rhd` holds. The owner then signs in
-   again. cli-common has no way yet to clear site storage around a launch.
-   `--fresh-profile` avoids it for one run, and logout removes the copy.
+**The confirm hook judges what it read.** The tab stays open on a session that does
+not parse, is past the point `rhd` would renew it, or that Robinhood refuses, until a
+new sign-in replaces it. `rhd` renews a minute before expiry, so the hook goes by the
+renewal rule (`Tokens::is_expired_at`), not the bare expiry, and a session is never
+stored already due for renewal. A refused token is remembered for the run and not sent
+again, so a tab on a dead session costs one read rather than one per poll. A read that
+cannot decide ends the wait with an error and takes nothing: a 429 or a 5xx whatever
+its body, or a success that is not the accounts list. An HTML page on any other status
+counts as a refusal; the tab stays open and that token is not sent again. `rhd` itself
+never renews from the window.
 
 A confirmed capture is read twice: once by the hook, to decide whether the tab
 closes, and once after it, to decide whether anything is stored.
@@ -440,8 +449,7 @@ close-on-capture above does not protect the copy):
 
 - that robinhood.com's sign-in completes in a kept-profile Chrome launched with
   a debug port, what a new device costs there, and what a known one saves (above);
-- what the web app does with an old `web:auth_state` when the window opens, and
-  whether it presents a retired refresh token (above);
+- whether a visible window's quit gets a fresh cookie to the disk (above);
 - that the `device_id` cookie is set by then, and whether `document.cookie`
   sees it (the bundle sets it from JavaScript; the jar read covers an
   `HttpOnly` one either way);

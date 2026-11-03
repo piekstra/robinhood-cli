@@ -172,18 +172,9 @@ enum AuthCmd {
 /// CLI's long help and refuses every other credential source and every
 /// password-login flag beside it at parse time (exit 2), before any config,
 /// keychain or network work.
-///
-/// `--fresh-profile` needs the same list of its own. Its `requires = "browser"`
-/// does not hold once one of these is present: clap counts a required argument
-/// as satisfied when it conflicts with an argument given, so
-/// `--session-stdin --fresh-profile` would parse and run the import.
 #[derive(clap::Args, Debug)]
 #[command(mut_arg("browser", |a| a
     .long_help(BROWSER_HELP)
-    .conflicts_with_all([
-        "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
-    ])))]
-#[command(mut_arg("fresh_profile", |a| a
     .conflicts_with_all([
         "session_stdin", "stdin", "from_env", "no_verify", "code", "resume", "username", "channel",
     ])))]
@@ -242,10 +233,10 @@ the token.
 
 The kept profile lets Robinhood remember this device, so a later sign-in
 often asks for less. It is a full Chrome profile, owner-only on disk:
-Robinhood's cookies, the session's tokens, browsing history with full URLs,
-the HTTP cache and site storage stay, after a failed sign-in too, until
-`rhd auth logout` removes it. --fresh-profile signs in through a scratch
-profile instead.
+Robinhood's cookies, browsing history with full URLs and the HTTP cache stay,
+after a failed sign-in too, until `rhd auth logout` removes it. The session's
+tokens do not: site storage goes before Chrome starts and again once it stops.
+--fresh-profile signs in through a scratch profile instead.
 
 Waits up to 10 minutes; Ctrl-C cancels. Chrome, Chromium or Edge is found
 at the standard install paths; set RHD_CHROME to use another binary.

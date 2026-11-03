@@ -58,9 +58,9 @@ const DEVICE_COOKIE_URL: &str = "https://robinhood.com/";
 /// `device_token`, or `device_token: null` when `document.cookie` cannot see
 /// it: what the Console snippet in `--session-stdin`'s help copies.
 ///
-/// It only reads, though the profile outlives the window. A removal from here is
-/// no guarantee: it may not reach the disk before Chrome stops, and the evaluation
-/// runs at least once, so it could also lose a session the capture never took.
+/// It only reads. The launch clears the profile's site storage
+/// (`commands::auth::browser_launch`), and the evaluation runs at least once, so a
+/// removal from here could lose a session the capture never took.
 /// Whether what it reads is worth taking is the confirm hook's call
 /// (`commands::auth::confirm_candidate`).
 pub const SESSION_EXPRESSION: &str = "(() => { \
@@ -216,9 +216,9 @@ pub fn parse(raw: &str, now: u64, source: Source) -> Result<Captured, CliError> 
                     "reload robinhood.com, which renews its session, and capture again"
                 }
                 Source::Browser => {
-                    "the window still held an old session and no new sign-in finished; sign in \
-                     again with `rhd auth login --browser`, and check this machine's clock if a \
-                     new session looks expired too"
+                    "the session in the window had expired; sign in again with `rhd auth login \
+                     --browser`, and check this machine's clock if a new session looks expired \
+                     too"
                 }
             };
             return Err(CliError::Auth(format!(
@@ -689,8 +689,8 @@ pub(crate) mod tests {
         assert!(SESSION_EXPRESSION.contains("device_token: d || null"));
     }
 
-    /// It only reads: a removal may not reach the disk, and the evaluation can
-    /// run more than once.
+    /// It only reads: the evaluation can run more than once, so a removal could
+    /// lose a session the capture never took.
     #[test]
     fn the_expression_only_reads() {
         for write in ["removeItem", "setItem", ".clear("] {

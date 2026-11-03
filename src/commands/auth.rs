@@ -14,15 +14,14 @@
 //!   after a real read succeeds with it, so a login that authenticates but
 //!   can't fetch anything leaves nothing broken behind. That holds for a
 //!   session from a browser (`--browser`, `--session-stdin`) too.
-//! - **A retired token is not taken from a window.** `--browser` runs Chrome in a
-//!   profile kept per login, so a re-login often asks for less, and that profile
-//!   still holds the page's copy of the tokens: the capture only reads
-//!   ([`capture::SESSION_EXPRESSION`]). The tab closes only on a session Robinhood
-//!   accepts ([`confirm_candidate`]).
-//! - **The kept profile is a full Chrome profile:** Robinhood's cookies, the
-//!   session's tokens, browsing history with full URLs, query strings included, the
-//!   HTTP cache and site storage. Chrome's cookie encryption does not cover anything
-//!   but the cookies, so the directory's `0700` mode is their only protection, and
+//! - **A window's tokens do not stay.** `--browser` runs Chrome in a profile kept per
+//!   login, so a re-login often asks for less. The page keeps the tokens in
+//!   `localStorage`, so [`browser_launch`] turns on `clear_site_storage`. The capture
+//!   only reads ([`capture::SESSION_EXPRESSION`]), and the tab closes only on a session
+//!   Robinhood accepts ([`confirm_candidate`]).
+//! - **The kept profile is a full Chrome profile:** Robinhood's cookies, browsing
+//!   history with full URLs, query strings included, and the HTTP cache. Chrome's
+//!   cookie encryption does not cover anything but the cookies, so the directory's `0700` mode is their only protection, and
 //!   ordinary backups usually include it. On Linux with no desktop keyring Chrome
 //!   encrypts the cookies with a fixed, publicly known key, so there the session
 //!   cookie has only `0700` too. It stays on disk until `auth logout` or `profiles remove`
@@ -349,9 +348,14 @@ fn through_the_window(
 /// refused here, before Chrome starts: the name is checked and never rewritten,
 /// so it can never land on another login's profile. `--fresh-profile` needs no
 /// name, so it still signs such a login in.
+///
+/// The page keeps the session's tokens in `localStorage`, and a refresh token left on
+/// disk could be presented by a later window after `rhd` has rotated it. So the kept
+/// profile keeps its cookies, the `device_id` among them, and never its site storage.
 fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Launch, CliError> {
     let launch = Launch::new(config::BIN)
         .url(capture::LOGIN_URL)
+        .clear_site_storage(true)
         .quiet(quiet);
     if fresh_profile {
         return Ok(launch.fresh_profile(true).login_hint(format!(
@@ -372,16 +376,14 @@ fn browser_launch(profile: &str, fresh_profile: bool, quiet: bool) -> Result<Lau
 
 /// Whether the session in the window is one to take, which closes the tab.
 ///
-/// The kept profile still holds the last sign-in's `web:auth_state` as the page
-/// opens. It may be expired or already rotated away. Taking it would close the tab
-/// before the web app could ask the owner to sign in. So a session that does not
-/// parse, is past the point `rhd` would renew it, or that Robinhood refuses keeps
-/// the tab open.
+/// Site storage goes before Chrome starts ([`browser_launch`]), so what the page
+/// holds was written in this window. Taking a session Robinhood will not honour would
+/// still close the tab before the web app could ask the owner to sign in. So a session
+/// that does not parse, is past the point `rhd` would renew it, or that Robinhood
+/// refuses keeps the tab open.
 ///
 /// That point is [`Tokens::is_expired_at`], `rhd`'s own renewal rule, not the
-/// token's bare expiry: in between, `rhd` may have rotated the refresh token
-/// while the access token still works, and storing that copy would replace the
-/// live session with a retired refresh token.
+/// token's bare expiry, so a session is never stored already due for renewal.
 ///
 /// A token Robinhood refused is remembered and not sent again (one attempt, no
 /// loops), so a tab sitting on a dead session costs one read rather than one
@@ -624,11 +626,10 @@ impl SessionImport {
             ));
         }
         out.push(match self.source {
-            // The window closed on capture, and its profile keeps the page's copy.
+            // The window closed on capture, and its profile stays.
             Source::Browser => "the sign-in window is closed, so no browser is renewing this \
-                                session; its Chrome profile, with a copy of the session's tokens \
-                                in it, stays on disk for the next sign-in until `rhd auth logout` \
-                                removes it"
+                                session; its Chrome profile, with Robinhood's cookies in it, stays \
+                                on disk for the next sign-in until `rhd auth logout` removes it"
                 .into(),
             Source::Stdin => "close the robinhood.com tab, but do not click Log out: logging out \
                               revokes the session rhd just stored"
@@ -742,8 +743,33 @@ pub fn status(
         }
     }
 
+    s.browser_profile = browser_profile_status(common.quiet, || {
+        pk_cli_browser::named_profile_exists(config::BIN, profile)
+    });
     s.emit(common.json);
     Ok(())
+}
+
+/// `auth status`'s browser field, for the login it reports on: whether a `--browser`
+/// sign-in keeps a profile for that login here. A kept profile, not a signed-in one.
+/// A name no Chrome profile can carry never had one. `auth status` works whatever
+/// state the CLI is in, so a profile that needs repair is a warning and leaves the
+/// field out. The check is passed in: the binary binds `named_profile_exists`, the
+/// tests `named_profile_exists_in` under a temp dir.
+fn browser_profile_status(
+    quiet: bool,
+    exists: impl FnOnce() -> Result<bool, BrowserError>,
+) -> Option<bool> {
+    match exists() {
+        Ok(kept) => Some(kept),
+        Err(BrowserError::Invalid(_)) => Some(false),
+        Err(e) => {
+            if !quiet {
+                eprintln!("warning: {e}");
+            }
+            None
+        }
+    }
 }
 
 /// Store a session a login obtained, under the lock a renewal holds, so a
@@ -994,9 +1020,9 @@ fn logged_out(profile: &str, forget: bool, browser: bool) -> String {
 }
 
 /// The browser step of `auth logout` and `profiles remove`: `true` when there
-/// was a kept profile to remove. That profile holds Robinhood's own cookies, a copy
-/// of the session's tokens, its browsing history and cache, so a logout removes it
-/// too and the next sign-in starts signed out. The removal is passed in: the
+/// was a kept profile to remove. That profile holds Robinhood's own cookies, its
+/// browsing history and cache, so a logout removes it too and the next sign-in starts
+/// signed out. The removal is passed in: the
 /// binary binds it to
 /// `forget_named_profile(BIN, name)`, the tests to `forget_named_profile_in`
 /// under a temp dir, so a test never removes the owner's real profile.
@@ -1531,11 +1557,10 @@ mod tests {
         }
     }
 
-    /// Inside the minute before expiry `rhd` renews, so a token that still
-    /// works may have had its refresh token rotated away. Storing it would
-    /// replace the live session, so it is never read, let alone taken.
+    /// Inside the minute before expiry `rhd` would renew it at once, so such a
+    /// token is never read, let alone taken.
     #[test]
-    fn a_token_rhd_may_already_have_renewed_is_not_taken() {
+    fn a_token_due_for_renewal_is_not_taken() {
         let refused = Mutex::new(None);
         let answer = confirm_candidate(&held(&token_until(NOW + 60)), NOW, &refused, |_| {
             panic!("a token inside the renewal window must not reach Robinhood")
@@ -1616,9 +1641,9 @@ mod tests {
     }
 
     /// A script that stands in for Chrome: it reports a debug port, marks the
-    /// profile it was given and sleeps until stopped. It is what a launch runs
-    /// in these tests, so the real profile selection and lock are exercised
-    /// and no Chrome starts.
+    /// profile it was given, writes to its site storage as a page would and sleeps
+    /// until stopped. It is what a launch runs in these tests, so the real profile
+    /// selection, lock and removals are exercised and no Chrome starts.
     #[cfg(unix)]
     fn stand_in_chrome(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1627,6 +1652,8 @@ mod tests {
             &path,
             "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --user-data-dir=*) \
              d=\"${a#--user-data-dir=}\";; esac; done\n: > \"$d/stand-in-ran\"\n\
+             mkdir -p \"$d/Default/Local Storage\"\n\
+             : > \"$d/Default/Local Storage/from-this-run\"\n\
              printf '1\\n/devtools/browser/dummy\\n' > \"$d/DevToolsActivePort\"\nexec sleep 60\n",
         )
         .unwrap();
@@ -1701,6 +1728,62 @@ mod tests {
         assert!(logout_browser(forget).unwrap());
         assert!(!parent.join("browser-profile-+dummy").exists());
         assert!(parent.join("browser-profile-dummy/stand-in-ran").exists());
+    }
+
+    /// What an earlier run left in this login's site storage is gone before Chrome
+    /// starts, what this run wrote is gone once it has stopped, and its cookies stay.
+    /// Another login's profile is not touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_profile_keeps_its_cookies_and_never_its_site_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let chrome = stand_in_chrome(tools.path());
+        drop(signing_in(root.path(), &chrome, "dummy-one", false).unwrap());
+        let default = kept_dir(root.path(), "dummy-one").join("Default");
+        let left_behind = default.join("Local Storage/leveldb");
+        std::fs::create_dir_all(&left_behind).unwrap();
+        std::fs::write(left_behind.join("000003.log"), "dummy").unwrap();
+        std::fs::write(default.join("Cookies"), "dummy").unwrap();
+        let other = kept_dir(root.path(), "dummy-two").join("Default/Local Storage");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let running = signing_in(root.path(), &chrome, "dummy-one", false).unwrap();
+        assert!(!left_behind.exists(), "cleared before Chrome starts");
+        assert!(default.join("Local Storage/from-this-run").exists());
+        drop(running);
+        assert!(!default.join("Local Storage").exists(), "and once it stops");
+        assert!(default.join("Cookies").exists());
+        assert!(other.exists());
+    }
+
+    /// `auth status` reports on the login it was asked about, not on any other's. A
+    /// path that needs repair is a warning that leaves the field out, never a failed
+    /// status, and a name that cannot carry a profile never had one.
+    #[cfg(unix)]
+    #[test]
+    fn auth_status_reports_the_active_logins_kept_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let field = |name: &str| {
+            browser_profile_status(true, || {
+                pk_cli_browser::named_profile_exists_in(root.path(), config::BIN, name)
+            })
+        };
+        assert_eq!(field("dummy-one"), Some(false));
+
+        std::fs::create_dir_all(kept_dir(root.path(), "dummy-one")).unwrap();
+        assert_eq!(field("dummy-one"), Some(true));
+        assert_eq!(field("dummy-two"), Some(false));
+        assert_eq!(field("has.dot"), Some(false));
+        let mut status = AuthStatus::new(true, false, AuthMethod::BrowserSession);
+        status.browser_profile = field("dummy-one");
+        assert_eq!(status.to_json()["browser_profile"], true);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), kept_dir(root.path(), "dummy-two")).unwrap();
+        assert_eq!(field("dummy-two"), None);
+        status.browser_profile = field("dummy-two");
+        assert!(status.to_json().get("browser_profile").is_none());
     }
 
     #[cfg(unix)]

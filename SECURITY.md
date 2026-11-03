@@ -155,34 +155,35 @@ It is a full Chrome profile, and that is the trade for fewer sign-ins. It holds:
   `__Host-Web-App-Secondary-Access-Token` cookie with the read-only secondary token;
 - browsing history with full URLs, query strings included;
 - the HTTP cache, for whatever the responses allow: account data among it;
-- `localStorage`, IndexedDB and other site storage;
 - any password you let Chrome save.
 
 Chrome encrypts its cookies at rest with a key from the system's keyring: on macOS
 the "Chrome Safe Storage" key in the login keychain. On Linux with no desktop
 keyring it falls back to a fixed, publicly known key, so there the session cookie
 has only the directory's `0700` mode protecting it. Everywhere, the encryption does
-not cover the history, the HTTP cache or site storage, so `0700` is their only
+not cover the history or the HTTP cache, so `0700` is their only
 protection. The directory sits where ordinary user-level backups usually look, so
 exclude it from any backup you don't want holding this.
 
-**The session's tokens stay in it.** The web app keeps its access and refresh
-tokens in `localStorage`'s `web:auth_state`, which Chrome does not encrypt, so `0700`
-is all that protects that copy of a live refresh token. The capture only reads: a
-removal from the page may not reach the disk before Chrome stops, and the evaluation
-can run more than once. Once `rhd` renews, the copy is retired, and the next window
-can present it, which at best signs it out and at worst ends the session in the
-keychain; you then sign in again. cli-common has no way yet to clear site storage
-around a launch. `--fresh-profile` avoids this for one run, and logout removes the
-copy. The capture refuses anything past the point `rhd` would renew it, or that
-Robinhood does not accept. A throttle or an outage during that check ends the wait
-with an error, and takes nothing.
+**The session's tokens do not stay in it.** The web app keeps its access and refresh
+tokens in `localStorage`'s `web:auth_state`, which Chrome does not encrypt. A refresh
+token left there would be retired at `rhd`'s next renewal, and a later window could
+present it, which at best signs it out and at worst ends the session in the keychain.
+So the profile keeps its cookies and never its site storage: `localStorage`,
+`sessionStorage`, IndexedDB, service workers and the rest are removed before Chrome
+starts, where a failure refuses the launch, and again once Chrome has stopped. A crash
+or a second Ctrl-C skips the second removal, as does a Chrome still running in the
+profile. The tokens are then on disk until the next launch or logout, with only `0700`
+protecting them. The capture only reads. It refuses anything past the point `rhd`
+would renew it, or that Robinhood does not accept. A throttle or an outage during that
+check ends the wait with an error, and takes nothing.
 
 **The profile outlives a failed sign-in.** However a sign-in fails once its window
 has opened (a timeout, a closed window, Ctrl-C, Robinhood throttled or down during
 the check, a keychain write that fails), the profile stays with what the sign-in got
-as far as, which can be a live session, and the error says so. `rhd auth status`
-reads only the keychain and config, so it does not show the profile.
+as far as, which can be a live session in its cookies, and the error says so. `rhd
+auth status` says whether that login keeps a profile, not whether anything is signed
+in there.
 
 ## Revoking access
 

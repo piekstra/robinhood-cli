@@ -96,20 +96,24 @@ systems use a scratch profile every time. `rhd auth login --browser
 --fresh-profile` signs in once through a scratch profile, deleted afterwards, and
 leaves the kept one alone.
 
-The trade is more than cookies. It is a full Chrome profile, so it also keeps a
-copy of the session's access and refresh tokens, browsing history with full URLs,
-query strings included, the HTTP cache and site storage, for whatever you open in
-that window. Chrome's cookie encryption does not cover those: the directory's `0700`
-mode is their only protection, and ordinary backups usually include the directory
-([`SECURITY.md`](SECURITY.md)). On Linux with no desktop keyring Chrome encrypts the
-cookies with a fixed, publicly known key, so there the session cookie has only
-`0700` too.
+The trade is more than cookies. It is a full Chrome profile, so it also keeps
+browsing history with full URLs, query strings included, and the HTTP cache, for
+whatever you open in that window. Chrome's cookie encryption does not cover those:
+the directory's `0700` mode is their only protection, and ordinary backups usually
+include the directory ([`SECURITY.md`](SECURITY.md)). On Linux with no desktop
+keyring Chrome encrypts the cookies with a fixed, publicly known key, so there the
+session cookie has only `0700` too.
+
+It does not keep the session's tokens. Robinhood's page holds them in site storage,
+which `rhd` removes before Chrome starts and again once Chrome has stopped. A crash
+or a second Ctrl-C skips the second removal; the next launch or `rhd auth logout`
+covers it.
 
 The profile stays after a failed sign-in too, and every failure once the window has
 opened says so: a timeout, a closed window, Ctrl-C, Robinhood throttled or down
 during the check, a keychain write that fails. Those can leave a live session in
-it. `rhd auth status` reads only the keychain and config, so it does
-not show the profile. `rhd auth logout` and `rhd profiles remove` remove it, for
+it. `rhd auth status` says whether that login keeps a profile (`browser_profile`
+with `--json`), not whether anything is signed in there. `rhd auth logout` and `rhd profiles remove` remove it, for
 that login only, and clear its stored session with it. They attempt every step even
 after one fails, then say what is cleared and what remains, and exit with the first
 failure's code. While a sign-in or a Chrome window is using the profile, they clear
@@ -383,9 +387,10 @@ Nothing sensitive is ever accepted on argv, and `rhd` writes none to disk itself
 With `rhd mcp --http`, its bearer token also lives in your Cloudflare Worker. A
 browser session arrives from the sign-in window over Chrome's DevTools protocol
 (`--browser`) or on stdin (`--session-stdin`). The one thing on disk is Chrome's own:
-the profile `--browser` keeps, a full Chrome profile with its cookies, a copy of the
-session's tokens, history, cache and site storage, until `rhd auth logout` removes
-it. See [`SECURITY.md`](SECURITY.md).
+the profile `--browser` keeps, a full Chrome profile with its cookies, history and
+cache, until `rhd auth logout` removes it. The session's tokens are in it only while
+a window is open, and after a crash until the next launch. See
+[`SECURITY.md`](SECURITY.md).
 
 ```console
 $ op read 'op://Private/robinhood/password' \
