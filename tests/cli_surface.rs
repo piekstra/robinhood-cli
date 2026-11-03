@@ -25,7 +25,12 @@ fn keychain_tests_enabled() -> bool {
 }
 
 fn rhd() -> Command {
-    Command::cargo_bin("rhd").expect("binary builds")
+    let mut c = Command::cargo_bin("rhd").expect("binary builds");
+    // No test touches the real server's token-refresh lock.
+    let home = std::env::temp_dir().join(format!("rhd-test-home-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("temp dir");
+    c.env("HOME", &home).env("USERPROFILE", &home);
+    c
 }
 
 /// A throwaway config path, so a test never reads or writes the developer's
@@ -520,6 +525,30 @@ fn session_stdin_rejects_input_it_cannot_read() {
         assert!(!all.contains(secret), "{tag}: echoed the input: {all}");
         assert!(!config.exists(), "{tag}: wrote config for a refused import");
     }
+}
+
+/// Bad input fails at once even while another process holds the lock the write
+/// would need: waiting would exit 5 after 75 s and never mention the input.
+#[test]
+fn session_stdin_rejects_bad_input_without_waiting_on_a_busy_lock() {
+    let home = tempfile::tempdir().unwrap();
+    pk_cli_auth::refresh_lock::RefreshLock::at(home.path().join(".config/rhd/token-refresh.lock"))
+        .hold(|| {
+            let mut cmd = rhd();
+            cmd.arg("--config")
+                .arg(scratch_config("sessbusy"))
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env_remove("RHD_PROFILE")
+                .env_remove("RHD_ACCOUNT");
+            piped(cmd)
+                .args(["auth", "login", "--session-stdin"])
+                .write_stdin("{not json")
+                .assert()
+                .code(2);
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]

@@ -31,6 +31,7 @@
 
 use std::sync::Mutex;
 
+use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, SetCredentialArgs};
 use pk_cli_browser::{BrowserError, Confirm, Launch};
 use pk_cli_config::ConfigStore;
@@ -64,6 +65,8 @@ pub fn login(
     let rh = Rh::new()?;
 
     let username = resolve_username(&cfg, profile, input, common)?;
+    // Before anything is spent: an approval or a code cannot be had twice.
+    RefreshLock::for_binary(config::BIN)?.before_signin()?;
     let password = resolve_password(&creds, profile, input, common)?;
 
     // A code (or an explicit --resume) belongs to the attempt that raised the
@@ -202,11 +205,13 @@ fn finish(
         None,
     )?;
 
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    // The device token first: it needs no lock, and it is what keeps the next
+    // attempt from presenting as a new device if the session cannot be stored.
     creds.set(
         &config::device_key(profile),
         &Secret::new(device_token.to_string()),
     )?;
+    store_session(creds, profile, &tokens)?;
 
     // `paginate` walked every page, so the listing is the whole login.
     record_profile(store, cfg, profile, Some(username), &accounts, true)?;
@@ -283,6 +288,8 @@ pub fn browser_login(
     fresh_profile: bool,
 ) -> Result<(), CliError> {
     let launch = browser_launch(profile, fresh_profile, common.quiet)?;
+    // Before the window: a sign-in the owner has finished is not thrown away.
+    RefreshLock::for_binary(config::BIN)?.before_signin()?;
     let refused = Mutex::new(None);
     let capture = capture::browser_capture()?.confirm(move |candidate| {
         confirm_candidate(
@@ -490,6 +497,9 @@ pub fn import_session(
     profile: &str,
     non_interactive: bool,
 ) -> Result<(), CliError> {
+    // Before the read: a session piped in once cannot be read again. It does not
+    // wait on a busy lock, so bad input still fails at once; the store waits.
+    RefreshLock::for_binary(config::BIN)?.try_hold(|| Ok(()))?;
     let raw = read_capture(common, non_interactive)?;
     import(common, store, cfg, profile, &raw, Source::Stdin)
 }
@@ -517,7 +527,7 @@ fn import(
         accounts_page(&page).ok_or_else(|| unproven(no_accounts_list(), shape, source))?;
 
     let creds = CredentialStore::for_binary(config::BIN);
-    creds.set(&config::token_key(profile), &tokens.to_secret())?;
+    store_session(&creds, profile, &tokens)?;
     // A captured session names no username; the proving read was one page.
     record_profile(store, &mut cfg, profile, None, &visible, !more)?;
 
@@ -736,6 +746,35 @@ pub fn status(
     Ok(())
 }
 
+/// Store a session a login obtained, under the lock a renewal holds, so a
+/// renewal in flight cannot overwrite it with the old session's tokens.
+fn store_session(creds: &CredentialStore, profile: &str, tokens: &Tokens) -> Result<(), CliError> {
+    RefreshLock::for_binary(config::BIN)?
+        .store_signin(|| creds.set(&config::token_key(profile), &tokens.to_secret()))
+}
+
+/// Delete a profile's session, under the lock a renewal holds if it can be had,
+/// so a renewal in flight cannot store it again after. The delete runs either
+/// way: the lock must not keep a credential on the machine.
+pub(crate) fn forget_session(creds: &CredentialStore, profile: &str) -> Result<(), CliError> {
+    RefreshLock::forget_for_binary(config::BIN, || creds.delete(&config::token_key(profile)))
+        .map(|_| ())
+}
+
+/// One keychain item of a logout or a removal. The session goes under the lock a
+/// renewal holds ([`forget_session`]), the rest directly.
+pub(crate) fn delete_item(
+    creds: &CredentialStore,
+    profile: &str,
+    key: &str,
+) -> Result<(), CliError> {
+    if key == config::token_key(profile) {
+        forget_session(creds, profile)
+    } else {
+        creds.delete(key).map(|_| ())
+    }
+}
+
 pub fn logout(
     common: &CommonArgs,
     store: &ConfigStore,
@@ -749,7 +788,7 @@ pub fn logout(
         cfg,
         profile,
         forget,
-        |key| creds.delete(key).map(|_| ()),
+        |key| delete_item(&creds, profile, key),
         || pk_cli_browser::forget_named_profile(config::BIN, profile),
     )?;
 
@@ -781,7 +820,7 @@ fn finish_logout(
     let mut steps = TeardownSteps::default();
     // The cached session and any half-finished login always go; `logout`
     // that leaves a resumable attempt behind isn't a logout.
-    steps.step("the session", delete(&config::token_key(profile)));
+    steps.session(delete(&config::token_key(profile)));
     if let Err(e) = delete(&config::pending_key(profile)) {
         steps.failed("a half-finished login", e);
     }
@@ -830,6 +869,19 @@ pub(crate) struct TeardownSteps {
 }
 
 impl TeardownSteps {
+    /// The session's removal. `Upstream` is the refresh lock's: the delete has run,
+    /// and what remains is a renewal in flight that can store the session again.
+    pub(crate) fn session(&mut self, result: Result<(), CliError>) {
+        let what = match &result {
+            Err(CliError::Upstream(_)) => {
+                self.finish_when = Some("In a minute, run");
+                "a renewal that can store the session again"
+            }
+            _ => "the session",
+        };
+        self.step(what, result);
+    }
+
     pub(crate) fn step(&mut self, what: &str, result: Result<(), CliError>) {
         match result {
             Ok(()) => self.cleared.push(what.to_string()),
@@ -895,8 +947,8 @@ impl TeardownSteps {
             "{title}: {cleared} and {remains}. {reasons}. {when} `{finish}` again to finish."
         );
         // The exit code is the first failure's. `Keychain` and `Other` share theirs,
-        // and `Other` puts no "keychain error:" in front of the whole report. Every
-        // step here fails as one of those two.
+        // and `Other` puts no "keychain error:" in front of the whole report. A held
+        // refresh lock is `Upstream`: exit 5 comes only with that variant's prefix.
         Err(match first {
             CliError::Keychain(_) => CliError::Other(message),
             first => reworded(first, |_| message),
@@ -2043,6 +2095,39 @@ mod tests {
         let message = err.to_string();
         assert!(message.starts_with("partly logged out of "), "{message}");
         assert!(!message.contains("keychain error"), "{message}");
+
+        // A refresh lock held past the wait: the prefix once, and not inside.
+        let err = finish_logout(
+            &store,
+            Ok(Config::default()),
+            "dummy-one",
+            false,
+            |key| {
+                if key == config::token_key("dummy-one") {
+                    Err(CliError::Upstream("dummy: lock held".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 5, "{err}");
+        let message = err.to_string();
+        assert_eq!(
+            message.matches("network/upstream error").count(),
+            1,
+            "{message}"
+        );
+        // The tokens are gone, so the report does not say they remain.
+        assert!(
+            message.contains("only a renewal that can store the session again remains"),
+            "{message}"
+        );
+        assert!(
+            message.contains("In a minute, run `rhd auth logout"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ fn stderr_lines(stderr: ChildStderr) -> Receiver<String> {
 struct Server {
     child: Child,
     port: u16,
+    start_line: String,
     _scratch: Scratch,
 }
 
@@ -99,6 +100,7 @@ impl Server {
                         return Self {
                             child,
                             port,
+                            start_line: line,
                             _scratch: scratch,
                         }
                     }
@@ -158,6 +160,13 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn the_start_line_names_the_version() {
+    let s = Server::start(Scratch::new());
+    let expected = format!("rhd {} mcp: serving", env!("CARGO_PKG_VERSION"));
+    assert!(s.start_line.contains(&expected), "{}", s.start_line);
 }
 
 #[test]

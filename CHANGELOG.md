@@ -2,9 +2,8 @@
 
 ## v0.5.0 — 2026-11-03
 
-Moves to cli-common v0.17.0 and Rust 1.89. A browser sign-in now runs in a profile
-`rhd` keeps per login, where it used to run in a scratch profile deleted after every
-sign-in.
+A browser sign-in now runs in a profile `rhd` keeps per login, where it used to run
+in a scratch profile deleted after every sign-in.
 
 - `rhd auth login --browser` keeps a Chrome profile on disk for each login profile,
   owner-only (`0700`), at

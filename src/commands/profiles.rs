@@ -135,7 +135,7 @@ pub fn remove(
         store,
         cfg,
         name,
-        |key| creds.delete(key).map(|_| ()),
+        |key| crate::commands::auth::delete_item(&creds, name, key),
         || pk_cli_browser::forget_named_profile(config::BIN, name),
     )?;
     if !common.quiet {
@@ -166,7 +166,7 @@ fn drop_profile(
     forget_browser: impl FnOnce() -> Result<bool, BrowserError>,
 ) -> Result<bool, CliError> {
     let mut steps = crate::commands::auth::TeardownSteps::default();
-    steps.step("the session", delete(&config::token_key(name)));
+    steps.session(delete(&config::token_key(name)));
     if let Err(e) = delete(&config::pending_key(name)) {
         steps.failed("a half-finished login", e);
     }
