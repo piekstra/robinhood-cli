@@ -112,7 +112,7 @@ covers it.
 If Robinhood refuses the session, the window stays open for a new sign-in. If the read
 cannot decide (a bot check, Robinhood throttled or down), `rhd` stores the session
 anyway, since the page held the only copy, exits 0, and warns even under `-q` that it is
-unverified; `--json` adds `verified: false`. If reads then keep failing, run `rhd auth
+unverified; `--json` says `verified: false`. If reads then keep failing, run `rhd auth
 login --browser --overwrite`. With a session already stored for this login, `--browser`
 stops before Chrome opens unless you pass `--overwrite`.
 

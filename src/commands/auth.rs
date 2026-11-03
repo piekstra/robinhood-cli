@@ -660,7 +660,7 @@ impl CheckedImport {
             expires_at: self.tokens.expires_at_rfc3339(),
             device_token: self.tokens.device_token.is_some(),
             read_only_token: self.tokens.read_only_token.is_some(),
-            verified: self.unverified.is_some().then_some(false),
+            verified: self.unverified.is_none(),
         }
     }
 }
@@ -770,10 +770,10 @@ struct SessionImport {
     device_token: bool,
     /// The session carries a read-only secondary token (stored, not used).
     read_only_token: bool,
-    /// `false` when the one read could not decide and the session was stored anyway.
-    /// Absent on a session a read proved.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verified: Option<bool>,
+    /// Always a boolean: `true` when the one read accepted the session, `false` when
+    /// it could not decide and the session was stored anyway. A sometimes-absent field
+    /// would make `jq '.verified == true'` wrong on the common case.
+    verified: bool,
 }
 
 impl SessionImport {
@@ -800,7 +800,7 @@ impl SessionImport {
             Source::Browser => "stored the browser sign-in's session",
             Source::Stdin => "imported a browser session",
         };
-        let mut out = vec![if self.verified == Some(false) {
+        let mut out = vec![if !self.verified {
             format!(
                 "{what} ({shape}) into profile `{}`, unverified, with no accounts read",
                 self.profile
@@ -1507,22 +1507,24 @@ mod tests {
             expires_at: Some("2026-11-03T00:00:00Z".into()),
             device_token: device,
             read_only_token: renewable,
-            verified: None,
+            verified: true,
         }
     }
 
-    /// `verified: false` is additive: on a verified login the field is absent, and
-    /// nothing else in the result differs.
+    /// The result always carries `verified` as a boolean, so `jq '.verified == true'`
+    /// is right on every route. Nothing else in the result differs.
     #[test]
-    fn the_result_says_verified_false_only_when_it_is_unverified() {
-        let proved =
+    fn the_result_always_says_verified() {
+        let mut proved =
             serde_json::to_value(report(capture::Shape::WebAuthState, true, true)).unwrap();
-        assert!(proved.get("verified").is_none(), "{proved}");
+        assert_eq!(proved["verified"], json!(true), "{proved}");
 
         let mut unproved = report(capture::Shape::WebAuthState, true, true);
-        unproved.verified = Some(false);
+        unproved.verified = false;
         let mut unproved = serde_json::to_value(unproved).unwrap();
         assert_eq!(unproved["verified"], json!(false), "{unproved}");
+
+        proved.as_object_mut().unwrap().remove("verified");
         unproved.as_object_mut().unwrap().remove("verified");
         assert_eq!(unproved, proved);
     }
@@ -1539,7 +1541,7 @@ mod tests {
         );
         let unverified = unverified_import(&raw, "dummy cause".into()).ok().unwrap();
         let shape = unverified.report("dummy-one");
-        assert_eq!(shape.verified, Some(false));
+        assert!(!shape.verified);
         assert_eq!(shape.accounts_visible, 0);
         assert_eq!(unverified.unverified.as_deref(), Some("dummy cause"));
 
@@ -1547,7 +1549,7 @@ mod tests {
             .ok()
             .unwrap();
         let shape = proven.report("dummy-one");
-        assert_eq!(shape.verified, None);
+        assert!(shape.verified);
         assert_eq!(shape.accounts_visible, 1);
     }
 
@@ -1555,7 +1557,7 @@ mod tests {
     #[test]
     fn the_unverified_warning_prints_under_quiet_and_json() {
         let mut result = report(capture::Shape::WebAuthState, true, true);
-        result.verified = Some(false);
+        result.verified = false;
         for common in [
             CommonArgs {
                 quiet: true,

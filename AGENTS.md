@@ -231,8 +231,9 @@ and a rate-limited one.
   `ReadFailure::definite_refusal` is a refusal (`NotYet`): a 401, or Robinhood's JSON on
   a 403. An accounts list is `Ready` with the page kept. Anything else is `Ready` with
   its cause in `WindowMemory::unverified`: `finish_window` stores the session,
-  `session-import/v1` says `verified: false`, and the warning prints under `-q` and
-  `--json` (`SessionImport::notes`). The page held the only copy, so it is stored.
+  `session-import/v1` says `verified: false` (always a boolean), and the warning prints
+  under `-q` and `--json` (`SessionImport::notes`). The page held the only copy, so it is
+  stored.
   `is_auth` stays as it is for ordinary reads, exit 3, and `--session-stdin` stores
   nothing unless its read proves it. `chrome_is_missing` keeps the surface tests, which
   stop at a missing `RHD_CHROME`, off the keychain.

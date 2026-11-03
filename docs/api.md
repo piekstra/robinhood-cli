@@ -379,8 +379,9 @@ list, a 404, a 403 with no JSON, or an HTML page on any status but a 401 ends th
 once with the session taken. `rhd` stores it, exits 0, and warns on stderr, under `-q`
 and `--json` too. The warning names the cause (a bot check names itself), says the
 session is unverified, and says that if reads keep failing, `rhd auth login --browser
---overwrite` is the way out. `--json` adds `verified: false` to `session-import/v1`,
-which is absent on a verified login. The page held the only local copy and site storage
+--overwrite` is the way out. `session-import/v1` says `verified: false`. It always
+carries `verified`, a boolean: `true` when a read accepted the session, so `jq '.verified
+== true'` is right on every route. The page held the only local copy and site storage
 goes when Chrome stops, so discarding the session would cost a new sign-in. Site storage
 also went before Chrome started, so a token in the page can only be this sign-in's: a bad
 one costs one more sign-in, the same as discarding it, and a good one costs none. An
@@ -461,8 +462,8 @@ moment it is captured means a wrong clock. The expiry comes from the JWT `exp`
 claim; `expires_in` is not used, because the capture does not say when that
 lifetime started. `--json` reports the import as `session-import/v1` (source,
 shape, accounts visible, whether it renews, expiry, whether a device id and a
-read-only token came with it, and `verified: false` when the read could not decide) —
-never a token.
+read-only token came with it, and `verified`: `true` when a read accepted the session,
+`false` when it could not decide) — never a token.
 
 **Traps of `--session-stdin`** (the owner's own tab stays open, so the
 close-on-capture above does not protect the copy):

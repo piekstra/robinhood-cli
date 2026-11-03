@@ -50,8 +50,9 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.19.0.
   401 or its own JSON is not sent again, and a timeout says what the read answered.
 - If that read cannot decide (a bot check's page, a throttle, an outage, a dropped
   connection, an answer that is not the accounts list), the sign-in is kept: the session
-  is stored, the exit is 0, `--json` adds `verified: false`, and a warning says why, even
-  under `-q`, that it is unverified, and that if reads keep failing, `rhd auth login
+  is stored, the exit is 0, `session-import/v1` says `verified: false` (it always carries
+  `verified`, a boolean, `true` when a read accepted the session), and a warning says why,
+  even under `-q`, that it is unverified, and that if reads keep failing, `rhd auth login
   --browser --overwrite` is the way out.
 - `rhd auth login --browser` now refuses before Chrome opens, exit 2, when this login
   already has a stored session and `--overwrite` was not passed. It used to replace the
