@@ -118,9 +118,10 @@ that login only, and clear its stored session with it. They attempt every step e
 after one fails, then say what is cleared and what remains, and exit with the first
 failure's code. While a sign-in or a Chrome window is using the profile, they clear
 the session, exit 1 and say what remains; close the window and run the command again.
-With a config file it cannot parse, `rhd auth logout --profile <NAME>` still runs
-every step but the config entry; without `--profile` or `RHD_PROFILE` it asks which
-login, since the name is in that file.
+`rhd auth logout --profile <NAME>` runs every step but the config entry even when the
+config file cannot be parsed or does not know that name, so what a failed first sign-in
+left can be removed. With a file it cannot parse and no `--profile` or `RHD_PROFILE`,
+it asks which login, since the name is in that file.
 
 A login whose name a Chrome profile cannot carry (anything but 1 to 64 ASCII
 letters, digits, `-` or `_`, which `rhd profiles add` already refuses) cannot keep

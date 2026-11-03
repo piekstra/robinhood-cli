@@ -159,6 +159,8 @@ enum AuthCmd {
     /// and what remains, and exits with the first failure's code. While Chrome is
     /// using the kept profile that is exit 1, with the rest already cleared. The
     /// config entry goes last, only once the rest is clear, so a retry finds it.
+    /// A login named with --profile runs every step even if the config does not know
+    /// it, so what a failed first sign-in left can be removed.
     Logout(LogoutArgs),
     /// Raw keychain write for rotation / headless setup.
     SetCredential(SetCredentialArgs),
