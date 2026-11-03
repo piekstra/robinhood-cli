@@ -442,6 +442,46 @@ mod tests {
         assert_eq!(*grants.lock().unwrap(), ["dummy-refresh-1"]);
     }
 
+    /// An outage at the token endpoint says nothing about the session, and its refresh
+    /// token may still work: it stays as it was, whatever the body, and the error is
+    /// exit 5 with no sign-in, a browser session's included.
+    #[test]
+    fn a_renewal_5xx_neither_replaces_nor_removes_the_session() {
+        const PAGE: &str = "<!DOCTYPE html><html><title>Service Unavailable</title></html>";
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            PAGE,
+            "",
+            "Service Unavailable",
+            r#"{"detail":"dummy outage"}"#,
+        ] {
+            let stored = Mutex::new(Some(expired("dummy-refresh-1")));
+            let err = renew_session(
+                &RefreshLock::at(dir.path().join("token-refresh.lock")),
+                || Ok(stored.lock().unwrap().clone().unwrap()),
+                not_renewable,
+                |_, _| {
+                    let answer = crate::client::renewal_answer(503, body).unwrap_err();
+                    Err(renewal_error(answer, true, "dummy-one"))
+                },
+                |fresh| {
+                    *stored.lock().unwrap() = Some(fresh.clone());
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 5, "{body}: {err}");
+            assert!(!err.to_string().contains("auth login"), "{body}: {err}");
+            let after = stored
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the session is still stored");
+            assert_eq!(after.refresh_token.as_deref(), Some("dummy-refresh-1"));
+            assert_eq!(after.access_token, expired("dummy-refresh-1").access_token);
+        }
+    }
+
     #[test]
     fn a_session_no_longer_expired_skips_the_grant() {
         let dir = tempfile::tempdir().unwrap();

@@ -196,9 +196,17 @@ impl<S: Source> RobinhoodTools<S> {
         match e {
             CliError::Auth(m) if m.contains(crate::client::SIGN_IN_MAY_NOT_HELP) => {
                 ToolError::auth(m).with_fix(format!(
-                    "Wait or try another network, then call the tool again. Only if it still \
-                     fails after that, ask the user to run `{login}` in a terminal. Tools never \
-                     sign in or create credentials themselves"
+                    "Wait or try another network, then call the tool again once. Only if it \
+                     still fails after that, ask the user to run `{login}` in a terminal. Tools \
+                     never sign in or create credentials themselves"
+                ))
+            }
+            CliError::Auth(m) if m.contains(crate::client::IF_LOGGED_OUT_ELSEWHERE) => {
+                ToolError::auth(m).with_fix(format!(
+                    "Ask the user whether this session was logged out or revoked elsewhere. If \
+                     it was, ask them to run `{login}` in a terminal now. If not, a bot check may \
+                     clear after waiting: wait, then call the tool again once, and do not keep \
+                     calling it. Tools never sign in or create credentials themselves"
                 ))
             }
             CliError::Auth(m) => ToolError::auth(m).with_fix(format!(

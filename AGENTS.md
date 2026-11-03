@@ -123,8 +123,9 @@ keychain write only, never across the sign-in: a login checks it first
 logout's or `profiles remove`'s delete runs with or without it
 (`auth::forget_session`).
 The tools never sign in: an auth error asks the user to run
-`rhd auth login --browser --overwrite --profile <NAME>` in a terminal, or to wait first
-after a block at the edge. A profile that cannot be chosen (several, no default) fails
+`rhd auth login --browser --overwrite --profile <NAME>` in a terminal, to wait first
+after a block at the edge, or, after an HTML 200, to sign in only if the session was
+logged out or revoked elsewhere. A profile that cannot be chosen (several, no default) fails
 each call, not the server.
 
 - Tests: `src/mcp/tests.rs` runs every tool in process over the fixtures
@@ -236,10 +237,13 @@ and a rate-limited one.
   under `-q` and `--json` (`SessionImport::notes`). The page held the only copy, so it is
   stored.
   `ReadFailure::is_edge_shaped` (an HTML page on any status but a 401, or a 403 with no
-  JSON) puts a new sign-in last in that warning, in an ordinary read's error, at a
-  renewal and in the MCP fix (`client::edge_block_advice`), because signing in does not
-  clear a block on this client. A 429, a 5xx or a dropped connection keeps "if reads
-  keep failing".
+  JSON) puts a new sign-in last in that warning (`client::edge_block_advice`), because
+  signing in does not clear a block on this client. So do a renewal's error, and an
+  ordinary read's error and the MCP fix for an HTML or bare 403. HTML on another status,
+  such as a 200, is also what a session logged out elsewhere answers, so an ordinary read
+  and the MCP fix name both remedies (`client::logged_out_or_blocked_advice`, docs/api.md
+  §4.1). A 429, a 5xx or a dropped connection keeps "if reads keep failing", and a 5xx
+  from the token endpoint is exit 5 with no sign-in (`client::token_answer`).
   `is_auth` stays as it is for ordinary reads, exit 3, and `--session-stdin` stores
   nothing unless its read proves it. `chrome_is_missing` keeps the surface tests, which
   stop at a missing `RHD_CHROME`, off the keychain.

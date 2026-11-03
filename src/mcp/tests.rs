@@ -638,7 +638,7 @@ fn a_block_at_the_edge_does_not_ask_for_a_new_sign_in_first() {
     let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
     assert!(text.starts_with("auth:"), "{text}");
     assert!(
-        text.contains("Wait or try another network, then call the tool again"),
+        text.contains("Wait or try another network, then call the tool again once"),
         "{text}"
     );
     assert!(
@@ -649,6 +649,51 @@ fn a_block_at_the_edge_does_not_ask_for_a_new_sign_in_first() {
     );
     assert!(text.contains("never sign in"), "{text}");
     assert!(!text.contains("in a terminal, then call"), "{text}");
+}
+
+/// An HTML page with a 200 may be a session logged out elsewhere, which no number of
+/// calls will clear, so the fix names both remedies and sets a limit on the retry.
+#[test]
+fn an_html_200_names_both_remedies_and_limits_the_retry() {
+    let t = RobinhoodTools::new(Fixtures::new(), Ok("household".into()));
+    const PAGE: &str = "<!DOCTYPE html><html><title>Log in</title></html>";
+    *t.source().fail.lock().unwrap() = Some(
+        crate::client::classify(200, "https://example.test/dummy", None, PAGE)
+            .unwrap_err()
+            .into_cli_error(),
+    );
+    let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
+    assert!(text.starts_with("auth:"), "{text}");
+    assert!(
+        text.contains("Ask the user whether this session was logged out or revoked elsewhere"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "ask them to run `rhd auth login --browser --overwrite --profile household` in a \
+             terminal now"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("a bot check may clear after waiting: wait, then call the tool again once"),
+        "{text}"
+    );
+    assert!(text.contains("do not keep calling it"), "{text}");
+    assert!(text.contains("never sign in"), "{text}");
+    assert!(!text.contains("in a terminal, then call"), "{text}");
+    assert!(!text.contains("Wait or try another network"), "{text}");
+}
+
+/// An outage at the token endpoint asks the agent for no sign-in.
+#[test]
+fn a_renewal_outage_asks_for_no_sign_in() {
+    let t = RobinhoodTools::new(Fixtures::new(), Ok("household".into()));
+    const PAGE: &str = "<!DOCTYPE html><html><title>Service Unavailable</title></html>";
+    *t.source().fail.lock().unwrap() = Some(crate::client::renewal_answer(503, PAGE).unwrap_err());
+    let text = err(&call(&t, PORTFOLIO_TOOL, json!({}))).to_string();
+    assert!(text.starts_with("upstream:"), "{text}");
+    assert!(!text.contains("auth login"), "{text}");
 }
 
 #[test]

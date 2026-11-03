@@ -395,8 +395,10 @@ What the warning says next depends on the answer:
 | Anything else that cannot decide: a 429, a 5xx, a dropped connection, a 404, an empty or unparseable 2xx, a success that is not the accounts list | A later read may settle it; if reads keep failing, run `rhd auth login --browser --overwrite`. |
 
 Signing in does not clear a block on this client, and each attempt spends a sign-in and
-replaces the stored session, exiting 0 each time. So an ordinary read's error (§4.1, still
-exit 3), a renewal's and the MCP tools' fix say what the first row says.
+replaces the stored session, exiting 0 each time. So a renewal's error, and an ordinary
+read's error and the MCP tools' fix for an HTML 403 or a 403 with no JSON, say what the
+first row says. An HTML page on another status names both remedies (§4.1), because an
+older session logged out elsewhere answers the same way.
 
 **A stored session is refused before Chrome opens.** With a session stored for this login
 and no `--overwrite`, `--browser` exits 2 before the window, so an unverified session
@@ -1250,13 +1252,31 @@ would encode a guess as a contract.
 
 `json_response` checks **shape before status**, because a lapsed session often
 comes back as an HTML login page with a `200`. HTML where JSON was expected is
-an auth failure (exit 3), not data. An HTML 401 names `rhd auth login --browser
---overwrite` at once. Any other HTML page, or a 403 with no JSON, says a new sign-in may
-not help, to wait or try another network, and only if reads still fail after that to run
-it (`client::edge_block_advice`). The exceptions are a 429 and a 5xx, read by status
-whatever the body: a
-throttle or an outage says nothing about the session. `--browser`'s confirm hook takes
-an HTML page as no verdict instead (§2.8).
+an auth failure (exit 3), not data. The exceptions are a 429 and a 5xx, read by status
+whatever the body: a throttle or an outage says nothing about the session.
+
+| An ordinary read's answer | How it is read | Exit | What the error says |
+| --- | --- | --- | --- |
+| A 401, whatever its body | Refused | 3 | Run `rhd auth login --browser --overwrite`. |
+| A 403 with JSON | Refused | 3 | Run `rhd auth login --browser --overwrite`. |
+| An HTML 403, or a 403 with no JSON | A block at the edge | 3 | A new sign-in may not help: wait or try another network, and only if reads still fail after that, run it (`client::edge_block_advice`). |
+| HTML on any other status, such as a 200 or a 404 | A bot check or a session logged out or revoked elsewhere, which the answer cannot tell apart | 3 | If the session was logged out or revoked elsewhere, sign in now with `rhd auth login --browser --overwrite`. Otherwise a bot check may clear after waiting (`client::logged_out_or_blocked_advice`). |
+| A 404 that is not HTML | Not found | 4 | The URL. |
+| A 429, whatever its body | A throttle | 5 | When to retry, and no sign-in. |
+| A 5xx, whatever its body | An outage | 5 | The status, and no sign-in. |
+| Any other non-2xx that is not HTML, or a 2xx that does not parse | No verdict | 5 | The status, and no sign-in. |
+
+An `rhd` session that is logged out elsewhere is not renewed first, because it has not
+expired by its own clock, so waiting would not help it. That is why an HTML 200 does not
+put the sign-in last. The MCP tools' fix follows the same row and asks for one more call
+at most. `--browser`'s confirm hook reads any HTML page as a block with no verdict,
+because that session was written moments ago (§2.8).
+
+The token endpoint (`client::token_answer`), at a renewal and at a password login, reads
+a 429 and a 5xx by status first too, with no sign-in. An outage there must not spend a
+sign-in or replace a session whose refresh token may still work. An HTML 401 names the
+login. Any other HTML page at a renewal puts the sign-in last, and at a password login it
+names the browser sign-in.
 
 401/403 → exit 3 · 404 → exit 4 · 429 and other non-2xx → exit 5.
 

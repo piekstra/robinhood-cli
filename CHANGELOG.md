@@ -58,8 +58,16 @@ in a scratch profile deleted after every sign-in. Moves to cli-common v0.20.0.
 - After a bot check's page or a 403 with no JSON, that warning says a new sign-in may not
   help, because the block is on the client rather than the session: wait or try another
   network, and only if reads still fail after that, run `rhd auth login --browser
-  --overwrite`. An ordinary read's error says the same, still exit 3, unless the answer
-  is a definite refusal, and so do a renewal's error and the MCP tools' fix.
+  --overwrite`. A renewal's error says the same, and so do an ordinary read's error,
+  still exit 3, and the MCP tools' fix for an HTML 403 or a 403 with no JSON.
+- An HTML page on an ordinary read with any other status, such as a 200, names both
+  remedies, still exit 3, because a session logged out or revoked elsewhere answers the
+  same way: if that happened, sign in now with `rhd auth login --browser --overwrite`;
+  otherwise a bot check may clear after waiting. The MCP tools' fix says the same and
+  asks for one more call at most.
+- A 5xx from the token endpoint is now exit 5 whatever its body, at a renewal and at a
+  password login, with no sign-in advice. An HTML 5xx was exit 3 and asked for a sign-in,
+  which during an outage could replace a session whose refresh token still worked.
 - A failed renewal of a browser session names `--overwrite`, because the session is still
   stored and `--browser` refuses without the flag.
 - `rhd auth login --help` no longer offers `--no-verify`, which no login path reads: the
