@@ -3,7 +3,8 @@
 ## v0.5.2 — 2026-11-04
 
 - `robinhood_activity` and `robinhood_documents`: a row with no id is an upstream error. It used to be left out of the list with nothing said.
-- Those tools stop reading after 90 seconds and name the arguments that shorten the call, rather than walking on after the server has answered.
+- Those tools stop reading after 90 seconds and name the arguments that shorten the call, if any do, rather than walking on after the server has answered.
+- A tool call holds one turn for its whole call and waits at most 45 seconds for it, then says another call has it.
 - `auth logout --forget` speaks to a server on `$RHD_MCP_TOKEN` too, which never had a keychain item to remove.
 - cli-common v0.29.0, up from v0.27.0.
 

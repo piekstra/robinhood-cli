@@ -18,13 +18,13 @@
 //! in itself: a missing or dead session is an auth error naming that command.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use pk_cli_core::dates::{self, Civil};
 use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_mcp::{
-    parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest, ReadBudget,
-    Server, SystemClock, ToolDef, ToolError, ToolOutput, Toolset, READ_BUDGET,
+    hold_within, parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest,
+    ReadBudget, Server, SystemClock, ToolDef, ToolError, ToolOutput, Toolset, READ_BUDGET,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ const INTEREST: &str = "interest";
 /// Where the tools get Robinhood's rows: the live API, or fixtures.
 #[allow(async_fn_in_trait)] // deliberate: no `Send` bound, as in `Toolset`
 pub trait Source {
+    /// One tool call's turn, held for the whole call: a call reads several lists, and a turn lost
+    /// between them would spend its time waiting and blame its arguments.
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError>;
     /// Every account row on the login with its number, closed ones included
     /// (`accounts::addressable_rows`).
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError>;
@@ -96,12 +99,14 @@ pub trait Source {
 /// that also holds off every other `rhd` process.
 pub struct LiveSource {
     ctx: Mutex<Ctx>,
+    one_at_a_time: Mutex<()>,
 }
 
 impl LiveSource {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx: Mutex::new(ctx),
+            one_at_a_time: Mutex::new(()),
         }
     }
 
@@ -112,10 +117,29 @@ impl LiveSource {
     }
 }
 
+/// How long a call waits for the one before it. Parallel calls from one model turn are normal, and
+/// past this the other call is a long walk or a prompt nobody has answered.
+const QUEUE_WAIT: Duration = Duration::from_secs(45);
+
+/// A call's turn at Robinhood, or the error that says another call still has it.
+fn turn_within(lock: &Mutex<()>, wait: Duration) -> Result<MutexGuard<'_, ()>, CliError> {
+    hold_within(lock, wait).ok_or_else(|| {
+        CliError::Upstream(
+            "another call to Robinhood is still running in this server, and may be waiting on a \
+             keychain prompt on this computer; ask the user to check for one, then try again"
+                .into(),
+        )
+    })
+}
+
 /// Blocking inside `async fn` is deliberate: the stdio server polls each call
 /// on its own blocking thread with no Tokio reactor (pk-cli-mcp's `Toolset`
 /// contract), which is where `reqwest::blocking` belongs.
 impl Source for LiveSource {
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError> {
+        turn_within(&self.one_at_a_time, QUEUE_WAIT).map(Some)
+    }
+
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError> {
         self.with(accounts::addressable_rows)
     }
@@ -554,6 +578,7 @@ impl<S: Source> RobinhoodTools<S> {
         let symbol = non_empty(args.symbol.as_deref());
         let page = PageRequest::new(&args.list, &PortfolioFilter { account, symbol })?;
         let detailed = args.list.format().is_detailed();
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
 
         // A valuation reads open accounts only, as `rhd net-worth` does.
         let all = self.source.accounts().await.map_err(|e| self.err(e))?;
@@ -675,6 +700,7 @@ impl<S: Source> RobinhoodTools<S> {
             d.is_none_or(|d| crate::commands::date_within(d, Some(&since), Some(&until)))
         };
 
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
         // History includes closed accounts: one can hold this year's trades.
         let all = self.source.accounts().await.map_err(|e| self.err(e))?;
         let every = named(&all);
@@ -696,7 +722,8 @@ impl<S: Source> RobinhoodTools<S> {
 
         // Robinhood filters orders by `since` and the account. It sends dividends and interest whole
         // for the login, so only leaving them out with `type` shortens those, and with a `type`
-        // named nothing does. The symbols to look up are those of the rows that matched.
+        // named nothing does. The symbol lookup follows those reads, so only what shortens them
+        // would leave it time, with `until` too for orders since it leaves fewer to look up.
         let orders_read = CallRead {
             budget,
             narrow: Some(if kind.is_none() {
@@ -711,11 +738,11 @@ impl<S: Source> RobinhoodTools<S> {
         };
         let symbols_read = CallRead {
             budget,
-            narrow: Some(if kind.is_none() {
-                "since/until, account or type"
-            } else {
-                "since/until or account"
-            }),
+            narrow: match kind.as_deref() {
+                None => Some("type"),
+                Some(TRADE) => Some("since/until or account"),
+                Some(_) => None,
+            },
         };
         let mut orders = Vec::new();
         if wants(TRADE) {
@@ -892,6 +919,7 @@ impl<S: Source> RobinhoodTools<S> {
             // With a type named, Robinhood already sends only that type.
             narrow: kind.is_none().then_some("type"),
         };
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
         let rows = self
             .source
             .documents(kind, read)
@@ -899,11 +927,12 @@ impl<S: Source> RobinhoodTools<S> {
             .map_err(|e| self.err(e))?;
         let parsed = rows
             .iter()
+            // A row outside the range is no part of this list, id or no id.
+            .filter(|r| documents::date_in_range(str_at(r, "date").as_deref(), &range))
             .map(|r| with_id(documents::to_document(r), "a document"))
             .collect::<Result<Vec<_>, ToolError>>()?;
         let matched = parsed
             .into_iter()
-            .filter(|d| documents::date_in_range(d.date.as_deref(), &range))
             .map(|d| {
                 let key = PositionKey::new(d.date.as_deref().unwrap_or_default(), &d.id);
                 let item = DocumentItem {

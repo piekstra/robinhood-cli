@@ -3,7 +3,7 @@
 //! mappers, and cli-common's conformance helper checks the definitions and
 //! every result's shape and size.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use pk_cli_mcp::conformance::{assert_conforms, assert_fits, call, definition_size};
 use pk_cli_mcp::CallToolResult;
@@ -34,8 +34,10 @@ struct Fixtures {
     fail: Mutex<Option<CliError>>,
     /// How long a read of the accounts takes.
     slow_accounts: std::time::Duration,
-    /// Whether the orders read leaves the budget to the reads after it.
-    orders_unchecked: bool,
+    /// Whether the walks leave the budget to the lookup after them.
+    walks_unchecked: bool,
+    /// The real lock, so a call that takes two turns fails as it would live.
+    queue: Mutex<()>,
 }
 
 impl Fixtures {
@@ -53,7 +55,8 @@ impl Fixtures {
             calls: Mutex::new(Vec::new()),
             fail: Mutex::new(None),
             slow_accounts: std::time::Duration::ZERO,
-            orders_unchecked: false,
+            walks_unchecked: false,
+            queue: Mutex::new(()),
         }
     }
 
@@ -80,6 +83,10 @@ fn owned_by(rows: &[Value], key: &str, account: &str) -> Vec<Value> {
 }
 
 impl Source for Fixtures {
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError> {
+        turn_within(&self.queue, std::time::Duration::from_millis(20)).map(Some)
+    }
+
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError> {
         std::thread::sleep(self.slow_accounts);
         self.record("accounts".into())?;
@@ -141,7 +148,7 @@ impl Source for Fixtures {
         since: &str,
         read: CallRead<'_>,
     ) -> Result<Vec<Value>, CliError> {
-        if !self.orders_unchecked {
+        if !self.walks_unchecked {
             read.check()?;
         }
         self.record(format!("orders:{account}:{since}"))?;
@@ -149,7 +156,9 @@ impl Source for Fixtures {
     }
 
     async fn dividends(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
-        read.check()?;
+        if !self.walks_unchecked {
+            read.check()?;
+        }
         self.record("dividends".into())?;
         Ok(self.dividends.clone())
     }
@@ -880,7 +889,7 @@ fn a_read_counts_the_time_before_its_first_walk() {
 #[test]
 fn a_symbol_lookup_stays_inside_the_budget() {
     let mut fixtures = Fixtures::new();
-    fixtures.orders_unchecked = true;
+    fixtures.walks_unchecked = true;
     let t = RobinhoodTools::new(fixtures, Ok("default".into()))
         .on(summer)
         .with_read_budget(std::time::Duration::ZERO);
@@ -891,6 +900,42 @@ fn a_symbol_lookup_stays_inside_the_budget() {
     ))
     .to_string();
     assert!(says.contains("narrow since/until or account"), "{says}");
+    // Dividends come whole for the login, so nothing named would leave the lookup more time.
+    let says = err(&call(
+        &t,
+        ACTIVITY_TOOL,
+        json!({"since": "2020-01-01", "type": "dividend"}),
+    ))
+    .to_string();
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(!says.contains("narrow"), "{says}");
+}
+
+/// A call waits a bounded time for the one before it, and says that is why it stopped: its
+/// arguments are not the problem. Every read of a call shares the one turn.
+#[test]
+fn a_call_with_no_turn_says_another_call_has_it() {
+    let t = tools();
+    let held = t.source.queue.lock().unwrap();
+    let says = err(&call(&t, ACTIVITY_TOOL, json!({"type": "trade"}))).to_string();
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(says.contains("another call"), "{says}");
+    drop(held);
+    let r = call(&t, ACTIVITY_TOOL, json!({"type": "trade"}));
+    assert!(!r.is_error(), "{}", r.text());
+}
+
+/// A row outside the range is no part of the list asked for, id or no id.
+#[test]
+fn a_document_with_no_id_outside_the_range_leaves_the_list_alone() {
+    let mut fixtures = Fixtures::new();
+    let mut old = fixtures.documents[0].clone();
+    old.as_object_mut().unwrap().remove("id");
+    old["date"] = json!("2001-01-01");
+    fixtures.documents.push(old);
+    let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+    let r = call(&t, DOCUMENTS_TOOL, json!({"since": "2020-01-01"}));
+    assert!(!r.is_error(), "{}", r.text());
 }
 
 /// A row of another symbol is no part of the list asked for, id or no id.
