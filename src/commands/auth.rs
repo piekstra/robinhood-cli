@@ -1097,7 +1097,8 @@ pub fn logout(
 ) -> Result<(), CliError> {
     let creds = CredentialStore::for_binary(config::BIN);
     let note = unconfigured_note(&cfg, profile);
-    let token_removed = std::cell::Cell::new(false);
+    // What the delete found: unanswered unless `--forget` asked, and it did not fail.
+    let token_answer = std::cell::Cell::new(None);
     let finished = finish_logout(
         store,
         cfg,
@@ -1105,18 +1106,18 @@ pub fn logout(
         forget,
         |key| {
             if key == pk_cli_mcp::HTTP_TOKEN_ACCOUNT {
-                token_removed.set(creds.delete(key)?);
+                token_answer.set(Some(creds.delete(key)?));
                 return Ok(());
             }
             delete_item(&creds, profile, key)
         },
         || pk_cli_browser::forget_named_profile(config::BIN, profile),
     );
-    let browser = owing_the_stop_note(finished, token_removed.get())?;
+    let browser = owing_the_stop_note(finished, token_answer.get() == Some(true))?;
 
     if !common.quiet {
         eprintln!("{}", logged_out(profile, forget, browser));
-        for line in logout_notes(note, token_removed.get()) {
+        for line in logout_notes(note, token_answer.get()) {
             eprintln!("{line}");
         }
     }
@@ -1124,10 +1125,10 @@ pub fn logout(
 }
 
 /// What a finished logout adds to its line.
-fn logout_notes(unconfigured: Option<String>, token_removed: bool) -> Vec<String> {
+fn logout_notes(unconfigured: Option<String>, token_answer: Option<bool>) -> Vec<String> {
     unconfigured
         .into_iter()
-        .chain(token_removed.then(|| pk_cli_mcp::stop_note(config::BIN)))
+        .chain(token_answer.map(|removed| pk_cli_mcp::forget_note(config::BIN, removed)))
         .collect()
 }
 
@@ -2841,10 +2842,19 @@ mod tests {
 
     #[test]
     fn a_finished_forget_that_removed_the_token_says_what_that_does_not_end() {
-        let notes = logout_notes(None, true);
+        let notes = logout_notes(None, Some(true));
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("keeps accepting the token"), "{notes:?}");
-        assert!(logout_notes(None, false).is_empty());
+        assert!(logout_notes(None, None).is_empty());
+    }
+
+    /// A server on the variable never had an item to remove.
+    #[test]
+    fn a_finished_forget_with_no_token_item_still_speaks_to_a_server_on_the_variable() {
+        let notes = logout_notes(None, Some(false));
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].contains("removed"), "{notes:?}");
+        assert!(notes[0].contains("$RHD_MCP_TOKEN"), "{notes:?}");
     }
 
     /// The rerun finds no item, so the run that failed after removing it is the only one that can

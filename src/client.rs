@@ -833,7 +833,19 @@ impl Rh {
         query: &[(&str, String)],
         limit: Option<u32>,
     ) -> Result<Vec<Value>, CliError> {
-        self.paginate_on(&self.base, token, &self.url(path), query, limit)
+        self.paginate_on(&self.base, token, &self.url(path), query, limit, &|| Ok(()))
+    }
+
+    /// [`Rh::paginate`] with no row limit, asking `before_page` before each request, so a tool
+    /// can stop a walk nobody is waiting for.
+    pub fn paginate_checked(
+        &self,
+        token: &str,
+        path: &str,
+        query: &[(&str, String)],
+        before_page: &dyn Fn() -> Result<(), CliError>,
+    ) -> Result<Vec<Value>, CliError> {
+        self.paginate_on(&self.base, token, &self.url(path), query, None, before_page)
     }
 
     /// [`Rh::paginate`] against another Robinhood origin — the `bonfire`
@@ -848,7 +860,7 @@ impl Rh {
         limit: Option<u32>,
     ) -> Result<Vec<Value>, CliError> {
         let url = format!("{}{}", origin.trim_end_matches('/'), path);
-        self.paginate_on(origin, token, &url, query, limit)
+        self.paginate_on(origin, token, &url, query, limit, &|| Ok(()))
     }
 
     fn paginate_on(
@@ -858,6 +870,7 @@ impl Rh {
         first_url: &str,
         query: &[(&str, String)],
         limit: Option<u32>,
+        before_page: &dyn Fn() -> Result<(), CliError>,
     ) -> Result<Vec<Value>, CliError> {
         let cap = limit.map(|l| l as usize).unwrap_or(usize::MAX);
         let mut out = Vec::new();
@@ -866,6 +879,7 @@ impl Rh {
         // A hard ceiling: an unbounded `next` chain is how a read turns into
         // thousands of requests against a rate-limited API.
         for _ in 0..200 {
+            before_page()?;
             let v = self.get(token, &url, if first { query } else { &[] })?;
             first = false;
             match v.get("results").and_then(Value::as_array) {
@@ -1405,6 +1419,53 @@ mod tests {
 
     fn rh() -> Rh {
         Rh::new().expect("client builds")
+    }
+
+    /// An API whose every page says there is another, and how many pages it has answered.
+    fn endless_pages() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let answered = std::sync::Arc::new(AtomicUsize::new(0));
+        let (next, count) = (base.clone(), answered.clone());
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().map_while(Result::ok) {
+                let mut chunk = [0u8; 4096];
+                let _ = conn.read(&mut chunk);
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = json!({"results": [{"n": 1}], "next": format!("{next}/rows/?more=1")})
+                    .to_string();
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, answered)
+    }
+
+    /// This hook is what stops a walk: no page is asked for once it refuses.
+    #[test]
+    fn a_walk_stops_before_the_page_its_check_refuses() {
+        use std::sync::atomic::Ordering;
+        let (base, answered) = endless_pages();
+        let mut rh = rh();
+        rh.base = base;
+        let checks = std::cell::Cell::new(0);
+        let e = rh
+            .paginate_checked("dummy-token", "/rows/", &[], &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() > 2 {
+                    return Err(CliError::Usage("out of time".into()));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e}");
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
     }
 
     /// A portal that answers its one request with a 307 to a port nobody may reach.

@@ -218,8 +218,10 @@ the session and exit 5 saying so, because a renewal in flight can store it again
 Run the command again in a minute to settle it.
 
 `rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`.
-`rhd auth logout --forget` removes that token from the keychain too, and says so, but a
-running server keeps the token it started with. Every login shares the token, so a server for
+`rhd auth logout --forget` removes that token from the keychain too, if there is one, and says
+what that does not end: a running server keeps the token it started with, and a token supplied
+through `$RHD_MCP_TOKEN` is not stored, so the logout cannot reach it. To end that one, unset the
+variable and stop the server. Every login shares the token, so a server for
 another login needs `mcp --new-token` at its next start. Either way the server stays up, its
 callers get auth errors, and **a later login silently restores the token holder's access**.
 Revoke that access separately:

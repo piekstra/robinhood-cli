@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "rhd",
   "display_name": "Robinhood (rhd)",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Read-only access to your own Robinhood net worth, positions, activity and tax documents, through the open-source rhd CLI.",
   "long_description": "Ask Claude about your Robinhood accounts: net worth and what you hold, what happened over a period (stock trades, dividends, cash interest), and which statements and tax forms exist. Three read-only tools, robinhood_portfolio, robinhood_activity and robinhood_documents; nothing can trade, transfer or change your account. Values cover cash and stocks/ETFs; options and crypto are not included. The extension asks for no password: Robinhood sign-in is through a browser, so first install the rhd CLI and run `rhd auth login --browser` in a terminal. That stores the session in your OS keychain, and the bundled rhd reads it from there and refreshes it in place. With several login profiles, it uses the default one (`rhd profiles use <NAME>`). On macOS the first call asks for keychain access; choose Always Allow. Unofficial; not affiliated with Robinhood Markets.",
   "author": {

@@ -18,17 +18,18 @@
 //! in itself: a missing or dead session is an auth error naming that command.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use pk_cli_core::dates::{self, Civil};
 use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_mcp::{
-    parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest, Server, ToolDef,
-    ToolError, ToolOutput, Toolset,
+    hold_within, parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest,
+    ReadBudget, Server, SystemClock, ToolDef, ToolError, ToolOutput, Toolset, READ_BUDGET,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::commands::dividends::{self, Dividend};
 use crate::commands::fanout::{self, Scope};
@@ -50,6 +51,9 @@ const INTEREST: &str = "interest";
 /// Where the tools get Robinhood's rows: the live API, or fixtures.
 #[allow(async_fn_in_trait)] // deliberate: no `Send` bound, as in `Toolset`
 pub trait Source {
+    /// One tool call's turn, held for the whole call: a call reads several lists, and a turn lost
+    /// between them would spend its time waiting and blame its arguments.
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError>;
     /// Every account row on the login with its number, closed ones included
     /// (`accounts::addressable_rows`).
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError>;
@@ -62,14 +66,29 @@ pub trait Source {
     ) -> Result<HashMap<String, i64>, CliError>;
     /// Ticker symbols for the instrument URLs on `rows`, keyed by URL.
     async fn symbols(&self, rows: &[&Value]) -> Result<HashMap<String, String>, CliError>;
+    /// [`Source::symbols`] inside a call's read budget.
+    async fn symbols_within(
+        &self,
+        rows: &[&Value],
+        read: CallRead<'_>,
+    ) -> Result<HashMap<String, String>, CliError>;
     /// One account's stock orders updated on or after `since`.
-    async fn orders(&self, account: &str, since: &str) -> Result<Vec<Value>, CliError>;
+    async fn orders(
+        &self,
+        account: &str,
+        since: &str,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError>;
     /// Every dividend on the login.
-    async fn dividends(&self) -> Result<Vec<Value>, CliError>;
+    async fn dividends(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError>;
     /// Every cash-sweep interest payment on the login.
-    async fn interest(&self) -> Result<Vec<Value>, CliError>;
+    async fn interest(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError>;
     /// Document rows, of one type when given.
-    async fn documents(&self, kind: Option<&str>) -> Result<Vec<Value>, CliError>;
+    async fn documents(
+        &self,
+        kind: Option<&str>,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError>;
 }
 
 /// The live API, through the same [`Ctx`] the commands use.
@@ -80,12 +99,14 @@ pub trait Source {
 /// that also holds off every other `rhd` process.
 pub struct LiveSource {
     ctx: Mutex<Ctx>,
+    one_at_a_time: Mutex<()>,
 }
 
 impl LiveSource {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx: Mutex::new(ctx),
+            one_at_a_time: Mutex::new(()),
         }
     }
 
@@ -96,10 +117,29 @@ impl LiveSource {
     }
 }
 
+/// How long a call waits for the one before it. Parallel calls from one model turn are normal, and
+/// past this the other call is a long walk or a prompt nobody has answered.
+const QUEUE_WAIT: Duration = Duration::from_secs(45);
+
+/// A call's turn at Robinhood, or the error that says another call still has it.
+fn turn_within(lock: &Mutex<()>, wait: Duration) -> Result<MutexGuard<'_, ()>, CliError> {
+    hold_within(lock, wait).ok_or_else(|| {
+        CliError::Upstream(
+            "another call to Robinhood is still running in this server, and may be waiting on a \
+             keychain prompt on this computer; ask the user to check for one, then try again"
+                .into(),
+        )
+    })
+}
+
 /// Blocking inside `async fn` is deliberate: the stdio server polls each call
 /// on its own blocking thread with no Tokio reactor (pk-cli-mcp's `Toolset`
 /// contract), which is where `reqwest::blocking` belongs.
 impl Source for LiveSource {
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError> {
+        turn_within(&self.one_at_a_time, QUEUE_WAIT).map(Some)
+    }
+
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError> {
         self.with(accounts::addressable_rows)
     }
@@ -126,40 +166,95 @@ impl Source for LiveSource {
         self.with(|ctx, token| instruments::resolve_symbols(ctx, token, rows))
     }
 
-    async fn orders(&self, account: &str, since: &str) -> Result<Vec<Value>, CliError> {
+    async fn symbols_within(
+        &self,
+        rows: &[&Value],
+        read: CallRead<'_>,
+    ) -> Result<HashMap<String, String>, CliError> {
+        self.with(|ctx, token| {
+            instruments::resolve_symbols_checked(ctx, token, rows, &|| read.check())
+        })
+    }
+
+    async fn orders(
+        &self,
+        account: &str,
+        since: &str,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
         let range = RangeArgs {
             since: Some(since.to_string()),
             ..RangeArgs::default()
         };
         self.with(|ctx, token| {
-            ctx.rh.paginate(
+            ctx.rh.paginate_checked(
                 token,
                 transactions::PATH,
                 &transactions::order_query(Some(account), &range),
-                None,
+                &|| read.check(),
             )
         })
     }
 
-    async fn dividends(&self) -> Result<Vec<Value>, CliError> {
-        self.with(|ctx, token| ctx.rh.paginate(token, dividends::PATH, &[], None))
+    async fn dividends(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        self.with(|ctx, token| {
+            ctx.rh
+                .paginate_checked(token, dividends::PATH, &[], &|| read.check())
+        })
     }
 
-    async fn interest(&self) -> Result<Vec<Value>, CliError> {
-        self.with(|ctx, token| ctx.rh.paginate(token, interest::PATH, &[], None))
+    async fn interest(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        self.with(|ctx, token| {
+            ctx.rh
+                .paginate_checked(token, interest::PATH, &[], &|| read.check())
+        })
     }
 
-    async fn documents(&self, kind: Option<&str>) -> Result<Vec<Value>, CliError> {
+    async fn documents(
+        &self,
+        kind: Option<&str>,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
         let query: Vec<(&'static str, String)> = kind
             .map(|k| vec![("type", k.to_string())])
             .unwrap_or_default();
-        self.with(|ctx, token| ctx.rh.paginate(token, documents::PATH, &query, None))
+        self.with(|ctx, token| {
+            ctx.rh
+                .paginate_checked(token, documents::PATH, &query, &|| read.check())
+        })
     }
+}
+
+/// One call's time to read its lists, and the arguments that shorten the read it is on, if any do.
+/// Robinhood's lists can run to hundreds of pages at its rate limit, and every page of a tool's
+/// answer reads them whole.
+#[derive(Clone, Copy)]
+pub struct CallRead<'a> {
+    budget: ReadBudget<'a>,
+    narrow: Option<&'static str>,
+}
+
+impl CallRead<'_> {
+    pub fn check(&self) -> Result<(), CliError> {
+        self.budget.check(self.narrow)
+    }
+}
+
+/// A row with no id is a changed provider: its place in the list could not be held.
+fn with_id<T>(row: Option<T>, what: &str) -> Result<T, ToolError> {
+    row.ok_or_else(|| {
+        ToolError::upstream(format!(
+            "Robinhood sent {what} with no id, so its place in this list cannot be held and the \
+             list is not reported"
+        ))
+    })
 }
 
 /// The toolset `rhd mcp` serves.
 pub struct RobinhoodTools<S: Source> {
     source: S,
+    /// How long a call may read for; a parameter so tests can run out of it.
+    read_budget: Duration,
     /// The login profile the source reads, named in the sign-in remedy, or
     /// why none could be chosen (several and no default, or an unknown
     /// name). That fails each call rather than the server's start, so the
@@ -173,9 +268,16 @@ impl<S: Source> RobinhoodTools<S> {
     pub fn new(source: S, profile: Result<String, CliError>) -> Self {
         Self {
             source,
+            read_budget: READ_BUDGET,
             profile,
             today: dates::today,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_read_budget(mut self, budget: Duration) -> Self {
+        self.read_budget = budget;
+        self
     }
 
     #[cfg(test)]
@@ -476,6 +578,7 @@ impl<S: Source> RobinhoodTools<S> {
         let symbol = non_empty(args.symbol.as_deref());
         let page = PageRequest::new(&args.list, &PortfolioFilter { account, symbol })?;
         let detailed = args.list.format().is_detailed();
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
 
         // A valuation reads open accounts only, as `rhd net-worth` does.
         let all = self.source.accounts().await.map_err(|e| self.err(e))?;
@@ -562,6 +665,8 @@ impl<S: Source> RobinhoodTools<S> {
     }
 
     async fn activity(&self, args: ActivityArgs) -> Result<ToolOutput, ToolError> {
+        let clock = SystemClock;
+        let budget = ReadBudget::start(&clock, self.read_budget);
         let (since, until) = window(
             non_empty(args.since.as_deref()),
             non_empty(args.until.as_deref()),
@@ -595,6 +700,7 @@ impl<S: Source> RobinhoodTools<S> {
             d.is_none_or(|d| crate::commands::date_within(d, Some(&since), Some(&until)))
         };
 
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
         // History includes closed accounts: one can hold this year's trades.
         let all = self.source.accounts().await.map_err(|e| self.err(e))?;
         let every = named(&all);
@@ -614,12 +720,36 @@ impl<S: Source> RobinhoodTools<S> {
             account.is_none() || number.is_some_and(|n| scope.iter().any(|a| a.number == n))
         };
 
+        // Robinhood filters orders by `since` and the account. It sends dividends and interest whole
+        // for the login, so only leaving them out with `type` shortens those, and with a `type`
+        // named nothing does. The symbol lookup follows those reads, so only what shortens them
+        // would leave it time, with `until` too for orders since it leaves fewer to look up.
+        let orders_read = CallRead {
+            budget,
+            narrow: Some(if kind.is_none() {
+                "since, account or type"
+            } else {
+                "since or account"
+            }),
+        };
+        let whole_read = CallRead {
+            budget,
+            narrow: kind.is_none().then_some("type"),
+        };
+        let symbols_read = CallRead {
+            budget,
+            narrow: match kind.as_deref() {
+                None => Some("type"),
+                Some(TRADE) => Some("since/until or account"),
+                Some(_) => None,
+            },
+        };
         let mut orders = Vec::new();
         if wants(TRADE) {
             for acct in &scope {
                 let rows = self
                     .source
-                    .orders(acct.number, &since)
+                    .orders(acct.number, &since, orders_read)
                     .await
                     .map_err(|e| self.err(e))?;
                 let tagged =
@@ -636,7 +766,7 @@ impl<S: Source> RobinhoodTools<S> {
         if wants(DIVIDEND) {
             paid = self
                 .source
-                .dividends()
+                .dividends(whole_read)
                 .await
                 .map_err(|e| self.err(e))?
                 .into_iter()
@@ -651,7 +781,7 @@ impl<S: Source> RobinhoodTools<S> {
         if wants(INTEREST) && symbol.is_none() {
             swept = self
                 .source
-                .interest()
+                .interest(whole_read)
                 .await
                 .map_err(|e| self.err(e))?
                 .into_iter()
@@ -667,76 +797,83 @@ impl<S: Source> RobinhoodTools<S> {
             HashMap::new()
         } else {
             self.source
-                .symbols(&needing)
+                .symbols_within(&needing, symbols_read)
                 .await
                 .map_err(|e| self.err(e))?
         };
 
-        let mut items: Vec<ActivityItem> = Vec::new();
-        for t in orders
-            .iter()
-            .filter_map(|r| Transaction::from_json(r, &symbols, false))
-        {
-            items.push(ActivityItem {
-                date: t.date,
-                kind: TRADE.into(),
-                symbol: t.symbol,
-                side: t.side,
-                quantity: t.quantity,
-                price: t.average_price.map(|m| m.amount),
-                amount: t.executed_notional.map(|m| m.amount),
-                state: t.state.filter(|s| detailed || s != "filled"),
-                account: name_of(t.account_number.as_deref()),
-                fees: t.fees.map(|m| m.amount).filter(|_| detailed),
-                id: Some(t.id),
-            });
+        // Each row's id goes into its position, and out of the concise answer.
+        let keyed = |id: String, mut item: ActivityItem| {
+            let key = PositionKey::new(item.date.as_deref().unwrap_or_default(), &id);
+            item.id = detailed.then_some(id);
+            (key, item)
+        };
+        // A row another symbol's is no part of this list, id or no id.
+        let for_symbol = |r: &Value| {
+            symbol.is_none_or(|s| {
+                str_at(r, "instrument")
+                    .and_then(|u| symbols.get(&u).cloned())
+                    .is_some_and(|x| x.eq_ignore_ascii_case(s))
+            })
+        };
+        let mut rows: Vec<(PositionKey, ActivityItem)> = Vec::new();
+        for r in orders.iter().filter(|r| for_symbol(r)) {
+            let t = with_id(Transaction::from_json(r, &symbols, false), "an order")?;
+            rows.push(keyed(
+                t.id,
+                ActivityItem {
+                    date: t.date,
+                    kind: TRADE.into(),
+                    symbol: t.symbol,
+                    side: t.side,
+                    quantity: t.quantity,
+                    price: t.average_price.map(|m| m.amount),
+                    amount: t.executed_notional.map(|m| m.amount),
+                    state: t.state.filter(|s| detailed || s != "filled"),
+                    account: name_of(t.account_number.as_deref()),
+                    fees: t.fees.map(|m| m.amount).filter(|_| detailed),
+                    ..ActivityItem::default()
+                },
+            ));
         }
-        for d in paid.iter().filter_map(|r| Dividend::from_json(r, &symbols)) {
-            items.push(ActivityItem {
-                date: d.date,
-                kind: DIVIDEND.into(),
-                symbol: d.symbol,
-                amount: d.amount.map(|m| m.amount),
-                state: d
-                    .state
-                    .filter(|s| detailed || !matches!(s.as_str(), "paid" | "reinvested")),
-                account: name_of(d.account_number.as_deref()),
-                id: Some(d.id),
-                ..ActivityItem::default()
-            });
+        for r in paid.iter().filter(|r| for_symbol(r)) {
+            let d = with_id(Dividend::from_json(r, &symbols), "a dividend")?;
+            rows.push(keyed(
+                d.id,
+                ActivityItem {
+                    date: d.date,
+                    kind: DIVIDEND.into(),
+                    symbol: d.symbol,
+                    amount: d.amount.map(|m| m.amount),
+                    state: d
+                        .state
+                        .filter(|s| detailed || !matches!(s.as_str(), "paid" | "reinvested")),
+                    account: name_of(d.account_number.as_deref()),
+                    ..ActivityItem::default()
+                },
+            ));
         }
-        for i in swept.iter().filter_map(Interest::from_json) {
-            items.push(ActivityItem {
-                date: i.date,
-                kind: INTEREST.into(),
-                amount: i.amount.map(|m| m.amount),
-                account: name_of(i.account_number.as_deref()),
-                id: Some(i.id),
-                ..ActivityItem::default()
-            });
+        for r in &swept {
+            let i = with_id(Interest::from_json(r), "an interest payment")?;
+            rows.push(keyed(
+                i.id,
+                ActivityItem {
+                    date: i.date,
+                    kind: INTEREST.into(),
+                    amount: i.amount.map(|m| m.amount),
+                    account: name_of(i.account_number.as_deref()),
+                    ..ActivityItem::default()
+                },
+            ));
         }
         if let Some(s) = symbol {
-            items.retain(|i| {
+            rows.retain(|(_, i)| {
                 i.symbol
                     .as_deref()
                     .is_some_and(|x| x.eq_ignore_ascii_case(s))
             });
         }
-        // Each row's id goes into its position, and out of the concise answer. Newest first; an
-        // undated row (kept, never dropped) sorts last.
-        let rows = items
-            .into_iter()
-            .map(|mut item| {
-                let key = PositionKey::new(
-                    item.date.as_deref().unwrap_or_default(),
-                    item.id.as_deref().unwrap_or_default(),
-                );
-                if !detailed {
-                    item.id = None;
-                }
-                (key, item)
-            })
-            .collect();
+        // Newest first; an undated row (kept, never dropped) sorts last.
         ToolOutput::new(&ActivityOut {
             since,
             until,
@@ -776,11 +913,26 @@ impl<S: Source> RobinhoodTools<S> {
             until: until.clone(),
             limit: None,
         };
-        let rows = self.source.documents(kind).await.map_err(|e| self.err(e))?;
-        let matched = rows
+        let clock = SystemClock;
+        let read = CallRead {
+            budget: ReadBudget::start(&clock, self.read_budget),
+            // With a type named, Robinhood already sends only that type.
+            narrow: kind.is_none().then_some("type"),
+        };
+        let _turn = self.source.turn().map_err(|e| self.err(e))?;
+        let rows = self
+            .source
+            .documents(kind, read)
+            .await
+            .map_err(|e| self.err(e))?;
+        let parsed = rows
             .iter()
-            .filter_map(documents::to_document)
-            .filter(|d| documents::date_in_range(d.date.as_deref(), &range))
+            // A row outside the range is no part of this list, id or no id.
+            .filter(|r| documents::date_in_range(str_at(r, "date").as_deref(), &range))
+            .map(|r| with_id(documents::to_document(r), "a document"))
+            .collect::<Result<Vec<_>, ToolError>>()?;
+        let matched = parsed
+            .into_iter()
             .map(|d| {
                 let key = PositionKey::new(d.date.as_deref().unwrap_or_default(), &d.id);
                 let item = DocumentItem {

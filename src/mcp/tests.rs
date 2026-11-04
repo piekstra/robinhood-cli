@@ -3,7 +3,7 @@
 //! mappers, and cli-common's conformance helper checks the definitions and
 //! every result's shape and size.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use pk_cli_mcp::conformance::{assert_conforms, assert_fits, call, definition_size};
 use pk_cli_mcp::CallToolResult;
@@ -32,6 +32,12 @@ struct Fixtures {
     calls: Mutex<Vec<String>>,
     /// When set, every call fails with this.
     fail: Mutex<Option<CliError>>,
+    /// How long a read of the accounts takes.
+    slow_accounts: std::time::Duration,
+    /// Whether the walks leave the budget to the lookup after them.
+    walks_unchecked: bool,
+    /// The real lock, so a call that takes two turns fails as it would live.
+    queue: Mutex<()>,
 }
 
 impl Fixtures {
@@ -48,6 +54,9 @@ impl Fixtures {
             documents: results(include_str!("../../tests/fixtures/documents.json")),
             calls: Mutex::new(Vec::new()),
             fail: Mutex::new(None),
+            slow_accounts: std::time::Duration::ZERO,
+            walks_unchecked: false,
+            queue: Mutex::new(()),
         }
     }
 
@@ -74,7 +83,12 @@ fn owned_by(rows: &[Value], key: &str, account: &str) -> Vec<Value> {
 }
 
 impl Source for Fixtures {
+    fn turn(&self) -> Result<Option<MutexGuard<'_, ()>>, CliError> {
+        turn_within(&self.queue, std::time::Duration::from_millis(20)).map(Some)
+    }
+
     async fn accounts(&self) -> Result<Vec<(String, Value)>, CliError> {
+        std::thread::sleep(self.slow_accounts);
         self.record("accounts".into())?;
         Ok(self
             .accounts
@@ -119,22 +133,48 @@ impl Source for Fixtures {
         )
     }
 
-    async fn orders(&self, account: &str, since: &str) -> Result<Vec<Value>, CliError> {
+    async fn symbols_within(
+        &self,
+        rows: &[&Value],
+        read: CallRead<'_>,
+    ) -> Result<HashMap<String, String>, CliError> {
+        read.check()?;
+        self.symbols(rows).await
+    }
+
+    async fn orders(
+        &self,
+        account: &str,
+        since: &str,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
+        if !self.walks_unchecked {
+            read.check()?;
+        }
         self.record(format!("orders:{account}:{since}"))?;
         Ok(owned_by(&self.orders, "account_number", account))
     }
 
-    async fn dividends(&self) -> Result<Vec<Value>, CliError> {
+    async fn dividends(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        if !self.walks_unchecked {
+            read.check()?;
+        }
         self.record("dividends".into())?;
         Ok(self.dividends.clone())
     }
 
-    async fn interest(&self) -> Result<Vec<Value>, CliError> {
+    async fn interest(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record("interest".into())?;
         Ok(self.sweeps.clone())
     }
 
-    async fn documents(&self, kind: Option<&str>) -> Result<Vec<Value>, CliError> {
+    async fn documents(
+        &self,
+        kind: Option<&str>,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record(format!("documents:{}", kind.unwrap_or("all")))?;
         Ok(self
             .documents
@@ -761,4 +801,156 @@ fn the_instructions_name_the_browser_login_and_the_scope() {
         text.contains("options and crypto are not included"),
         "{text}"
     );
+}
+
+/// A row with no id could not hold its place in a position cursor, so it is a changed provider and
+/// not a row left to the count within its day.
+#[test]
+fn an_activity_row_with_no_id_is_an_upstream_error() {
+    for strip in ["orders", "dividends", "sweeps"] {
+        let mut fixtures = Fixtures::new();
+        let rows = match strip {
+            "orders" => &mut fixtures.orders,
+            "dividends" => &mut fixtures.dividends,
+            _ => &mut fixtures.sweeps,
+        };
+        rows.iter_mut().for_each(|row| {
+            row.as_object_mut().unwrap().remove("id");
+        });
+        let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+        let r = call(
+            &t,
+            ACTIVITY_TOOL,
+            json!({"since": "2020-01-01", "until": "2026-12-31"}),
+        );
+        let says = err(&r);
+        assert!(says.starts_with("upstream:"), "{strip}: {says}");
+        assert!(says.contains("no id"), "{strip}: {says}");
+    }
+}
+
+#[test]
+fn a_document_with_no_id_is_an_upstream_error() {
+    let mut fixtures = Fixtures::new();
+    fixtures.documents.iter_mut().for_each(|row| {
+        row.as_object_mut().unwrap().remove("id");
+    });
+    let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+    let r = call(&t, DOCUMENTS_TOOL, json!({}));
+    let says = err(&r);
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(says.contains("no id"), "{says}");
+}
+
+/// A walk past its time says what shortens it, rather than answering at the server's limit with
+/// nobody told why.
+/// The error names what shortens the read that ran out: Robinhood filters orders by `since` and the
+/// account, and sends dividends and interest whole for the login.
+#[test]
+fn a_read_past_its_budget_names_what_shortens_that_read() {
+    let t = tools().with_read_budget(std::time::Duration::ZERO);
+    let says = err(&call(&t, ACTIVITY_TOOL, json!({"since": "2026-01-01"}))).to_string();
+    assert!(says.starts_with("usage:"), "{says}");
+    assert!(says.contains("narrow since, account or type"), "{says}");
+
+    let says = err(&call(&t, ACTIVITY_TOOL, json!({"type": "trade"}))).to_string();
+    assert!(says.contains("narrow since or account"), "{says}");
+
+    for kind in ["dividend", "interest"] {
+        let says = err(&call(&t, ACTIVITY_TOOL, json!({"type": kind}))).to_string();
+        assert!(says.starts_with("upstream:"), "{kind}: {says}");
+        assert!(!says.contains("narrow"), "{kind}: {says}");
+    }
+
+    let says = err(&call(&t, DOCUMENTS_TOOL, json!({}))).to_string();
+    assert!(says.contains("narrow type"), "{says}");
+    let says = err(&call(
+        &t,
+        DOCUMENTS_TOOL,
+        json!({"type": "account_statement"}),
+    ))
+    .to_string();
+    assert!(says.starts_with("upstream:"), "{says}");
+}
+
+/// A wait for the accounts, behind another call's walk, is time the caller has already spent.
+#[test]
+fn a_read_counts_the_time_before_its_first_walk() {
+    let mut fixtures = Fixtures::new();
+    fixtures.slow_accounts = std::time::Duration::from_millis(30);
+    let t = RobinhoodTools::new(fixtures, Ok("default".into()))
+        .on(summer)
+        .with_read_budget(std::time::Duration::from_millis(10));
+    let says = err(&call(&t, ACTIVITY_TOOL, json!({"type": "trade"}))).to_string();
+    assert!(says.contains("narrow since or account"), "{says}");
+}
+
+/// The lookup after the walks can run past the limit as they can.
+#[test]
+fn a_symbol_lookup_stays_inside_the_budget() {
+    let mut fixtures = Fixtures::new();
+    fixtures.walks_unchecked = true;
+    let t = RobinhoodTools::new(fixtures, Ok("default".into()))
+        .on(summer)
+        .with_read_budget(std::time::Duration::ZERO);
+    let says = err(&call(
+        &t,
+        ACTIVITY_TOOL,
+        json!({"since": "2020-01-01", "type": "trade"}),
+    ))
+    .to_string();
+    assert!(says.contains("narrow since/until or account"), "{says}");
+    // Dividends come whole for the login, so nothing named would leave the lookup more time.
+    let says = err(&call(
+        &t,
+        ACTIVITY_TOOL,
+        json!({"since": "2020-01-01", "type": "dividend"}),
+    ))
+    .to_string();
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(!says.contains("narrow"), "{says}");
+}
+
+/// A call waits a bounded time for the one before it, and says that is why it stopped: its
+/// arguments are not the problem. Every read of a call shares the one turn.
+#[test]
+fn a_call_with_no_turn_says_another_call_has_it() {
+    let t = tools();
+    let held = t.source.queue.lock().unwrap();
+    let says = err(&call(&t, ACTIVITY_TOOL, json!({"type": "trade"}))).to_string();
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(says.contains("another call"), "{says}");
+    drop(held);
+    let r = call(&t, ACTIVITY_TOOL, json!({"type": "trade"}));
+    assert!(!r.is_error(), "{}", r.text());
+}
+
+/// A row outside the range is no part of the list asked for, id or no id.
+#[test]
+fn a_document_with_no_id_outside_the_range_leaves_the_list_alone() {
+    let mut fixtures = Fixtures::new();
+    let mut old = fixtures.documents[0].clone();
+    old.as_object_mut().unwrap().remove("id");
+    old["date"] = json!("2001-01-01");
+    fixtures.documents.push(old);
+    let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+    let r = call(&t, DOCUMENTS_TOOL, json!({"since": "2020-01-01"}));
+    assert!(!r.is_error(), "{}", r.text());
+}
+
+/// A row of another symbol is no part of the list asked for, id or no id.
+#[test]
+fn a_row_with_no_id_for_another_symbol_leaves_the_list_alone() {
+    let mut fixtures = Fixtures::new();
+    let mut other = fixtures.orders[0].clone();
+    other.as_object_mut().unwrap().remove("id");
+    other["instrument"] = json!("https://api.robinhood.com/instruments/no-such-instrument/");
+    fixtures.orders.push(other);
+    let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+    let r = call(
+        &t,
+        ACTIVITY_TOOL,
+        json!({"since": "2020-01-01", "type": "trade", "symbol": "SAMPL"}),
+    );
+    assert!(!r.is_error(), "{}", r.text());
 }
