@@ -131,7 +131,9 @@ $ op read 'op://Private/robinhood/password' \
 
 `rhd auth logout` removes that login's token bundle and any parked login from the
 keychain, and its kept browser profile. `--forget` also removes its password and
-device token, and drops the login from the config, as `rhd profiles remove` does.
+device token, and the connector token `mcp-http-token` that every login shares, and
+drops the login from the config. `rhd profiles remove` does the same but leaves
+`mcp-http-token`, so retiring one login does not stop a server for another.
 Every step is attempted even after one fails, and the error says what is cleared,
 what remains and how to finish, with the first failure's exit code. The config entry
 goes last, only once the rest is clear, so the retry can find the login. The browser
@@ -147,6 +149,8 @@ A release before 0.5.0 does not know the kept profiles, and its `auth logout` le
 them behind. Run `rhd auth logout --profile <NAME>` for each login before downgrading,
 or delete `~/Library/Application Support/piekstra.rhd/browser-profile-*` (on Linux,
 under `$XDG_DATA_HOME` or `~/.local/share`) by hand afterwards.
+
+On Windows, whose Credential Manager holds 2,560 bytes per credential, a longer value is stored across several credentials with the suffix `.pk-split-` and read back whole. After a downgrade, run `rhd auth logout --forget` again from a current build: an older build's logout leaves the parts.
 
 ## The kept browser profile
 
@@ -213,9 +217,12 @@ has held the lock past the wait, `rhd auth logout` and `rhd profiles remove` del
 the session and exit 5 saying so, because a renewal in flight can store it again.
 Run the command again in a minute to settle it.
 
-`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`. The
-server stays up, its callers get auth errors, and **a later login silently
-restores the token holder's access**. Revoke that access separately:
+`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`.
+`rhd auth logout --forget` removes that token from the keychain too, and says so, but a
+running server keeps the token it started with. Every login shares the token, so a server for
+another login needs `mcp --new-token` at its next start. Either way the server stays up, its
+callers get auth errors, and **a later login silently restores the token holder's access**.
+Revoke that access separately:
 
 - **Invalidate the token:** `rhd mcp --new-token --overwrite`, then restart the
   server (`launchctl kickstart -k gui/$(id -u)/com.piekstra.rhd-mcp-http`). The

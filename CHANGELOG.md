@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.1 — 2026-11-03
+
+Moves to cli-common v0.27.0.
+
+- `auth logout --forget` removes the connector token `mcp-http-token`, which every login shares,
+  and says what that does not end: a running `rhd mcp --http` keeps the token it started with.
+- `robinhood_activity` and `robinhood_documents` page by position, so a row that arrives between
+  pages repeats nothing and skips nothing. Rows of the same day now run in a fixed order of their
+  own. A cursor from an earlier version still works, as the count of rows it holds.
+- A password, a code or a refresh token stays on the host it was for. reqwest re-sends a body on a
+  307 or 308, so a POST refuses a redirect to another host, and other requests refuse one that
+  leaves https.
+- An error no longer quotes a URL's query, in reqwest's text or its own. On Windows, a session too
+  long for one credential is split and read back as one.
+
 ## v0.5.0 — 2026-11-03
 
 A browser sign-in now runs in a profile `rhd` keeps per login, where it used to run

@@ -23,7 +23,8 @@ use std::sync::Mutex;
 use pk_cli_core::dates::{self, Civil};
 use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_mcp::{
-    parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
+    parse_args, ListArgs, Order, Page, PageRequest, PositionKey, PositionRequest, Server, ToolDef,
+    ToolError, ToolOutput, Toolset,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -576,7 +577,7 @@ impl<S: Source> RobinhoodTools<S> {
             }
         }
         let symbol = non_empty(args.symbol.as_deref());
-        let page = PageRequest::new(
+        let page = PositionRequest::new(
             &args.list,
             &ActivityFilter {
                 since: &since,
@@ -687,7 +688,7 @@ impl<S: Source> RobinhoodTools<S> {
                 state: t.state.filter(|s| detailed || s != "filled"),
                 account: name_of(t.account_number.as_deref()),
                 fees: t.fees.map(|m| m.amount).filter(|_| detailed),
-                id: detailed.then_some(t.id),
+                id: Some(t.id),
             });
         }
         for d in paid.iter().filter_map(|r| Dividend::from_json(r, &symbols)) {
@@ -700,7 +701,7 @@ impl<S: Source> RobinhoodTools<S> {
                     .state
                     .filter(|s| detailed || !matches!(s.as_str(), "paid" | "reinvested")),
                 account: name_of(d.account_number.as_deref()),
-                id: detailed.then_some(d.id),
+                id: Some(d.id),
                 ..ActivityItem::default()
             });
         }
@@ -710,7 +711,7 @@ impl<S: Source> RobinhoodTools<S> {
                 kind: INTEREST.into(),
                 amount: i.amount.map(|m| m.amount),
                 account: name_of(i.account_number.as_deref()),
-                id: detailed.then_some(i.id),
+                id: Some(i.id),
                 ..ActivityItem::default()
             });
         }
@@ -721,12 +722,29 @@ impl<S: Source> RobinhoodTools<S> {
                     .is_some_and(|x| x.eq_ignore_ascii_case(s))
             });
         }
-        // Newest first; an undated row (kept, never dropped) sorts last.
-        items.sort_by(|a, b| b.date.cmp(&a.date));
+        // Each row's id goes into its position, and out of the concise answer. Newest first; an
+        // undated row (kept, never dropped) sorts last.
+        let rows = items
+            .into_iter()
+            .map(|mut item| {
+                let key = PositionKey::new(
+                    item.date.as_deref().unwrap_or_default(),
+                    item.id.as_deref().unwrap_or_default(),
+                );
+                if !detailed {
+                    item.id = None;
+                }
+                (key, item)
+            })
+            .collect();
         ToolOutput::new(&ActivityOut {
             since,
             until,
-            page: page.page(items, "since/until, account, type or symbol")?,
+            page: page.page(
+                rows,
+                Order::Descending,
+                "since/until, account, type or symbol",
+            )?,
         })
     }
 
@@ -744,7 +762,7 @@ impl<S: Source> RobinhoodTools<S> {
                 )));
             }
         }
-        let page = PageRequest::new(
+        let page = PositionRequest::new(
             &args.list,
             &DocumentsFilter {
                 kind,
@@ -759,23 +777,23 @@ impl<S: Source> RobinhoodTools<S> {
             limit: None,
         };
         let rows = self.source.documents(kind).await.map_err(|e| self.err(e))?;
-        let mut docs: Vec<_> = rows
+        let matched = rows
             .iter()
             .filter_map(documents::to_document)
             .filter(|d| documents::date_in_range(d.date.as_deref(), &range))
-            .collect();
-        docs.sort_by(|a, b| b.date.cmp(&a.date));
-        let matched = docs
-            .into_iter()
-            .map(|d| DocumentItem {
-                date: d.date,
-                name: d.name,
-                kind: d.category,
-                id: detailed.then_some(d.id),
+            .map(|d| {
+                let key = PositionKey::new(d.date.as_deref().unwrap_or_default(), &d.id);
+                let item = DocumentItem {
+                    date: d.date,
+                    name: d.name,
+                    kind: d.category,
+                    id: detailed.then_some(d.id),
+                };
+                (key, item)
             })
             .collect();
         ToolOutput::new(&DocumentsOut {
-            page: page.page(matched, "type or since/until")?,
+            page: page.page(matched, Order::Descending, "type or since/until")?,
         })
     }
 }
