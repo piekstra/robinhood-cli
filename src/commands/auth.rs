@@ -2839,8 +2839,6 @@ mod tests {
         }
     }
 
-    /// Without its config entry, `--profile` could not find the login again
-    /// once other logins exist, so the entry stays until the retry finishes.
     #[test]
     fn a_finished_forget_that_removed_the_token_says_what_that_does_not_end() {
         let notes = logout_notes(None, true);
@@ -2887,6 +2885,8 @@ mod tests {
             .contains("keeps accepting"));
     }
 
+    /// Without its config entry, `--profile` could not find the login again
+    /// once other logins exist, so the entry stays until the retry finishes.
     #[test]
     fn a_refused_forget_leaves_the_login_configured_for_the_retry() {
         let dir = tempfile::tempdir().unwrap();
