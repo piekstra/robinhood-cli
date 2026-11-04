@@ -1098,7 +1098,7 @@ pub fn logout(
     let creds = CredentialStore::for_binary(config::BIN);
     let note = unconfigured_note(&cfg, profile);
     let token_removed = std::cell::Cell::new(false);
-    let browser = finish_logout(
+    let finished = finish_logout(
         store,
         cfg,
         profile,
@@ -1111,18 +1111,41 @@ pub fn logout(
             delete_item(&creds, profile, key)
         },
         || pk_cli_browser::forget_named_profile(config::BIN, profile),
-    )?;
+    );
+    let browser = owing_the_stop_note(finished, token_removed.get())?;
 
     if !common.quiet {
         eprintln!("{}", logged_out(profile, forget, browser));
-        if let Some(note) = note {
-            eprintln!("{note}");
-        }
-        if token_removed.get() {
-            eprintln!("{}", pk_cli_mcp::stop_note(config::BIN));
+        for line in logout_notes(note, token_removed.get()) {
+            eprintln!("{line}");
         }
     }
     Ok(())
+}
+
+/// What a finished logout adds to its line.
+fn logout_notes(unconfigured: Option<String>, token_removed: bool) -> Vec<String> {
+    unconfigured
+        .into_iter()
+        .chain(token_removed.then(|| pk_cli_mcp::stop_note(config::BIN)))
+        .collect()
+}
+
+/// A logout that failed after removing the connector token still says what that does not end: the
+/// rerun it asks for finds no item, so no later run can.
+fn owing_the_stop_note<T>(
+    finished: Result<T, CliError>,
+    token_removed: bool,
+) -> Result<T, CliError> {
+    finished.map_err(|e| {
+        if token_removed {
+            reworded(e, |m| {
+                format!("{m}\n{}", pk_cli_mcp::stop_note(config::BIN))
+            })
+        } else {
+            e
+        }
+    })
 }
 
 /// A logout's steps, each attempted whatever an earlier one did: one that fails
@@ -2818,6 +2841,52 @@ mod tests {
 
     /// Without its config entry, `--profile` could not find the login again
     /// once other logins exist, so the entry stays until the retry finishes.
+    #[test]
+    fn a_finished_forget_that_removed_the_token_says_what_that_does_not_end() {
+        let notes = logout_notes(None, true);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("keeps accepting the token"), "{notes:?}");
+        assert!(logout_notes(None, false).is_empty());
+    }
+
+    /// The rerun finds no item, so the run that failed after removing it is the only one that can
+    /// say this.
+    #[test]
+    fn a_forget_that_fails_after_removing_the_token_says_what_that_does_not_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(config::BIN).with_override(Some(dir.path().join("c.json")));
+        let mut cfg = Config::default();
+        cfg.profiles.insert("dummy-one".into(), Default::default());
+        let removed = std::cell::Cell::new(false);
+        let finished = finish_logout(
+            &store,
+            Ok(cfg),
+            "dummy-one",
+            true,
+            |key| {
+                removed.set(removed.get() || key == pk_cli_mcp::HTTP_TOKEN_ACCOUNT);
+                Ok(())
+            },
+            || {
+                Err(BrowserError::ProfileInUse(
+                    "dummy: close that window".into(),
+                ))
+            },
+        );
+        assert!(removed.get());
+        let e = owing_the_stop_note(finished, removed.get()).unwrap_err();
+        assert_eq!(e.exit_code(), 1, "{e}");
+        let says = e.to_string();
+        assert!(says.contains("the connector token"), "{says}");
+        assert!(says.contains("keeps accepting the token"), "{says}");
+
+        let untouched = owing_the_stop_note::<()>(Err(CliError::Other("dummy".into())), false);
+        assert!(!untouched
+            .unwrap_err()
+            .to_string()
+            .contains("keeps accepting"));
+    }
+
     #[test]
     fn a_refused_forget_leaves_the_login_configured_for_the_retry() {
         let dir = tempfile::tempdir().unwrap();

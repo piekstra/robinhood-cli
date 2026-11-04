@@ -131,7 +131,8 @@ $ op read 'op://Private/robinhood/password' \
 
 `rhd auth logout` removes that login's token bundle and any parked login from the
 keychain, and its kept browser profile. `--forget` also removes its password and
-device token, and drops the login from the config, as `rhd profiles remove` does.
+device token, and the connector token `mcp-http-token` that every login shares, and
+drops the login from the config, as `rhd profiles remove` does.
 Every step is attempted even after one fails, and the error says what is cleared,
 what remains and how to finish, with the first failure's exit code. The config entry
 goes last, only once the rest is clear, so the retry can find the login. The browser

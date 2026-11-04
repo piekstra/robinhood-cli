@@ -742,12 +742,13 @@ impl Rh {
 
     fn post_json(&self, url: &str, body: &Value) -> Result<Value, CliError> {
         self.pace();
-        let resp = self
-            .post_http
-            .post(url)
-            .json(body)
-            .send()
-            .map_err(|e| CliError::Upstream(format!("calling {url}: {}", e.without_url())))?;
+        let resp = self.post_http.post(url).json(body).send().map_err(|e| {
+            CliError::Upstream(format!(
+                "calling {}: {}",
+                origin_and_path(url),
+                e.without_url()
+            ))
+        })?;
         json_response(resp)
     }
 
@@ -772,9 +773,13 @@ impl Rh {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let resp = req
-            .send()
-            .map_err(|e| ReadFailure::Upstream(format!("calling {url}: {}", e.without_url())))?;
+        let resp = req.send().map_err(|e| {
+            ReadFailure::Upstream(format!(
+                "calling {}: {}",
+                origin_and_path(url),
+                e.without_url()
+            ))
+        })?;
         read_json(resp)
     }
 
@@ -881,7 +886,8 @@ impl Rh {
                     // the API origin — the request carries the bearer token.
                     if !same_origin_of(origin, n) {
                         return Err(CliError::Upstream(format!(
-                            "refusing to follow a pagination cursor off the API origin: {n}"
+                            "refusing to follow a pagination cursor off the API origin: {}",
+                            origin_and_path(n)
                         )));
                     }
                     url = n.to_string();
@@ -902,10 +908,13 @@ impl Rh {
         filetype: Option<&str>,
     ) -> Result<Vec<u8>, CliError> {
         self.pace();
-        let resp =
-            self.http.get(url).bearer_auth(token).send().map_err(|e| {
-                CliError::Upstream(format!("downloading {url}: {}", e.without_url()))
-            })?;
+        let resp = self.http.get(url).bearer_auth(token).send().map_err(|e| {
+            CliError::Upstream(format!(
+                "downloading {}: {}",
+                origin_and_path(url),
+                e.without_url()
+            ))
+        })?;
         let status = resp.status().as_u16();
         let retry_after = header_value(&resp, "retry-after");
         if status == 429 {
@@ -1157,10 +1166,23 @@ pub fn json_response(resp: reqwest::blocking::Response) -> Result<Value, CliErro
     read_json(resp).map_err(ReadFailure::into_cli_error)
 }
 
+/// A URL as a message can name it. A query can hold an account number, and a document's link can be
+/// signed by its query, so an error never quotes one.
+fn origin_and_path(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => "the request".to_string(),
+    }
+}
+
 /// [`json_response`] without the advice: the typed cause of a failure.
 fn read_json(resp: reqwest::blocking::Response) -> Result<Value, ReadFailure> {
     let status = resp.status().as_u16();
-    let url = resp.url().to_string();
+    let url = origin_and_path(resp.url().as_str());
     let retry_after = header_value(&resp, "retry-after");
     let text = resp.text().map_err(|e| {
         ReadFailure::Upstream(format!("reading response body: {}", e.without_url()))
@@ -1385,9 +1407,8 @@ mod tests {
         Rh::new().expect("client builds")
     }
 
-    /// reqwest re-sends a body on a 307, so this is what would carry the password away.
-    #[test]
-    fn a_token_post_answered_with_a_307_to_another_host_sends_the_body_nowhere() {
+    /// A portal that answers its one request with a 307 to a port nobody may reach.
+    fn portal_that_redirects_elsewhere() -> (String, std::net::TcpListener) {
         use std::io::{Read, Write};
         let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         elsewhere.set_nonblocking(true).unwrap();
@@ -1404,16 +1425,61 @@ mod tests {
                  content-length: 0\r\nconnection: close\r\n\r\n"
             );
         });
-        let mut rh = rh();
-        rh.base = base;
-        let form = [("password", "dummy-password".to_string())];
-        let e = rh.post_token(&form, None).unwrap_err();
-        assert_eq!(e.exit_code(), 5, "{e}");
+        (base, elsewhere)
+    }
+
+    fn heard_nothing(elsewhere: &std::net::TcpListener) {
         assert_eq!(
             elsewhere.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
             "the other host heard nothing"
         );
+    }
+
+    /// reqwest re-sends a body on a 307, so this is what would carry the password away.
+    #[test]
+    fn a_token_post_answered_with_a_307_to_another_host_sends_the_body_nowhere() {
+        let (base, elsewhere) = portal_that_redirects_elsewhere();
+        let mut rh = rh();
+        rh.base = base;
+        let form = [("password", "dummy-password".to_string())];
+        let e = rh.post_token(&form, None).unwrap_err();
+        assert_eq!(e.exit_code(), 5, "{e}");
+        heard_nothing(&elsewhere);
+    }
+
+    /// The same for a JSON body, which can hold a challenge's code.
+    #[test]
+    fn a_json_post_answered_with_a_307_to_another_host_sends_the_body_nowhere() {
+        let (base, elsewhere) = portal_that_redirects_elsewhere();
+        let e = rh()
+            .post_json(&format!("{base}/challenge"), &json!({"code": "000000"}))
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 5, "{e}");
+        heard_nothing(&elsewhere);
+    }
+
+    #[test]
+    fn a_message_names_a_url_without_its_query() {
+        assert_eq!(
+            origin_and_path("https://api.example.com/orders/?account_numbers=000#top"),
+            "https://api.example.com/orders/"
+        );
+        assert_eq!(origin_and_path("not a url?secret=1"), "the request");
+    }
+
+    /// Nothing listens here, so the send itself fails, with a signed link in hand.
+    #[test]
+    fn a_failed_send_does_not_quote_the_links_query() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let url = format!("http://127.0.0.1:{port}/doc?signature=dummy-signature");
+        let e = rh()
+            .download_document("dummy-token", &url, None)
+            .unwrap_err();
+        assert!(!e.to_string().contains("dummy-signature"), "{e}");
+        assert!(e.to_string().contains("/doc"), "{e}");
     }
 
     #[test]

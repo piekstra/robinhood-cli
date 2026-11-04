@@ -12,8 +12,8 @@ Moves to cli-common v0.27.0.
 - A password, a code or a refresh token stays on the host it was for. reqwest re-sends a body on a
   307 or 308, so a POST refuses a redirect to another host, and other requests refuse one that
   leaves https.
-- A network error no longer quotes the URL's query. On Windows, a session too long for one
-  credential is split and read back as one.
+- An error no longer quotes a URL's query, in reqwest's text or its own. On Windows, a session too
+  long for one credential is split and read back as one.
 
 ## v0.5.0 — 2026-11-03
 
