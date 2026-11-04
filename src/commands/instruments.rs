@@ -35,14 +35,30 @@ pub fn resolve_symbols(
     token: &str,
     rows: &[&Value],
 ) -> Result<std::collections::HashMap<String, String>, CliError> {
+    resolve_symbols_checked(ctx, token, rows, &|| Ok(()))
+}
+
+/// [`resolve_symbols`], asking `before_read` before each request, so a tool can stop a lookup
+/// nobody is waiting for.
+pub fn resolve_symbols_checked(
+    ctx: &Ctx,
+    token: &str,
+    rows: &[&Value],
+    before_read: &dyn Fn() -> Result<(), CliError>,
+) -> Result<std::collections::HashMap<String, String>, CliError> {
     let quiet = ctx.common.quiet;
     resolve_symbols_with(
         rows,
         |chunk| {
-            ctx.rh
-                .paginate(token, INSTRUMENTS_PATH, &[("ids", chunk.join(","))], None)
+            ctx.rh.paginate_checked(
+                token,
+                INSTRUMENTS_PATH,
+                &[("ids", chunk.join(","))],
+                before_read,
+            )
         },
         |id| {
+            before_read()?;
             if !quiet {
                 eprintln!("resolving instrument {id} on its own: the batched lookup left it out");
             }

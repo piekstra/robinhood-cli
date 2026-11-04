@@ -1421,6 +1421,53 @@ mod tests {
         Rh::new().expect("client builds")
     }
 
+    /// An API whose every page says there is another, and how many pages it has answered.
+    fn endless_pages() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let answered = std::sync::Arc::new(AtomicUsize::new(0));
+        let (next, count) = (base.clone(), answered.clone());
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().map_while(Result::ok) {
+                let mut chunk = [0u8; 4096];
+                let _ = conn.read(&mut chunk);
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = json!({"results": [{"n": 1}], "next": format!("{next}/rows/?more=1")})
+                    .to_string();
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, answered)
+    }
+
+    /// This hook is what stops a walk: no page is asked for once it refuses.
+    #[test]
+    fn a_walk_stops_before_the_page_its_check_refuses() {
+        use std::sync::atomic::Ordering;
+        let (base, answered) = endless_pages();
+        let mut rh = rh();
+        rh.base = base;
+        let checks = std::cell::Cell::new(0);
+        let e = rh
+            .paginate_checked("dummy-token", "/rows/", &[], &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() > 2 {
+                    return Err(CliError::Usage("out of time".into()));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e}");
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+    }
+
     /// A portal that answers its one request with a 307 to a port nobody may reach.
     fn portal_that_redirects_elsewhere() -> (String, std::net::TcpListener) {
         use std::io::{Read, Write};

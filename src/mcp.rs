@@ -63,6 +63,12 @@ pub trait Source {
     ) -> Result<HashMap<String, i64>, CliError>;
     /// Ticker symbols for the instrument URLs on `rows`, keyed by URL.
     async fn symbols(&self, rows: &[&Value]) -> Result<HashMap<String, String>, CliError>;
+    /// [`Source::symbols`] inside a call's read budget.
+    async fn symbols_within(
+        &self,
+        rows: &[&Value],
+        read: CallRead<'_>,
+    ) -> Result<HashMap<String, String>, CliError>;
     /// One account's stock orders updated on or after `since`.
     async fn orders(
         &self,
@@ -136,6 +142,16 @@ impl Source for LiveSource {
         self.with(|ctx, token| instruments::resolve_symbols(ctx, token, rows))
     }
 
+    async fn symbols_within(
+        &self,
+        rows: &[&Value],
+        read: CallRead<'_>,
+    ) -> Result<HashMap<String, String>, CliError> {
+        self.with(|ctx, token| {
+            instruments::resolve_symbols_checked(ctx, token, rows, &|| read.check())
+        })
+    }
+
     async fn orders(
         &self,
         account: &str,
@@ -185,17 +201,18 @@ impl Source for LiveSource {
     }
 }
 
-/// One call's time to read its lists, and what would shorten them. Robinhood's lists can run to
-/// hundreds of pages at its rate limit, and every page of a tool's answer reads them whole.
+/// One call's time to read its lists, and the arguments that shorten the read it is on, if any do.
+/// Robinhood's lists can run to hundreds of pages at its rate limit, and every page of a tool's
+/// answer reads them whole.
 #[derive(Clone, Copy)]
 pub struct CallRead<'a> {
     budget: ReadBudget<'a>,
-    narrow: &'static str,
+    narrow: Option<&'static str>,
 }
 
 impl CallRead<'_> {
     pub fn check(&self) -> Result<(), CliError> {
-        self.budget.check(Some(self.narrow))
+        self.budget.check(self.narrow)
     }
 }
 
@@ -203,7 +220,8 @@ impl CallRead<'_> {
 fn with_id<T>(row: Option<T>, what: &str) -> Result<T, ToolError> {
     row.ok_or_else(|| {
         ToolError::upstream(format!(
-            "Robinhood sent {what} with no id, so this list is not reported; its answer has changed"
+            "Robinhood sent {what} with no id, so its place in this list cannot be held and the \
+             list is not reported"
         ))
     })
 }
@@ -622,6 +640,8 @@ impl<S: Source> RobinhoodTools<S> {
     }
 
     async fn activity(&self, args: ActivityArgs) -> Result<ToolOutput, ToolError> {
+        let clock = SystemClock;
+        let budget = ReadBudget::start(&clock, self.read_budget);
         let (since, until) = window(
             non_empty(args.since.as_deref()),
             non_empty(args.until.as_deref()),
@@ -674,17 +694,35 @@ impl<S: Source> RobinhoodTools<S> {
             account.is_none() || number.is_some_and(|n| scope.iter().any(|a| a.number == n))
         };
 
-        let clock = SystemClock;
-        let read = CallRead {
-            budget: ReadBudget::start(&clock, self.read_budget),
-            narrow: "since/until, account or type",
+        // Robinhood filters orders by `since` and the account. It sends dividends and interest whole
+        // for the login, so only leaving them out with `type` shortens those, and with a `type`
+        // named nothing does. The symbols to look up are those of the rows that matched.
+        let orders_read = CallRead {
+            budget,
+            narrow: Some(if kind.is_none() {
+                "since, account or type"
+            } else {
+                "since or account"
+            }),
+        };
+        let whole_read = CallRead {
+            budget,
+            narrow: kind.is_none().then_some("type"),
+        };
+        let symbols_read = CallRead {
+            budget,
+            narrow: Some(if kind.is_none() {
+                "since/until, account or type"
+            } else {
+                "since/until or account"
+            }),
         };
         let mut orders = Vec::new();
         if wants(TRADE) {
             for acct in &scope {
                 let rows = self
                     .source
-                    .orders(acct.number, &since, read)
+                    .orders(acct.number, &since, orders_read)
                     .await
                     .map_err(|e| self.err(e))?;
                 let tagged =
@@ -701,7 +739,7 @@ impl<S: Source> RobinhoodTools<S> {
         if wants(DIVIDEND) {
             paid = self
                 .source
-                .dividends(read)
+                .dividends(whole_read)
                 .await
                 .map_err(|e| self.err(e))?
                 .into_iter()
@@ -716,7 +754,7 @@ impl<S: Source> RobinhoodTools<S> {
         if wants(INTEREST) && symbol.is_none() {
             swept = self
                 .source
-                .interest(read)
+                .interest(whole_read)
                 .await
                 .map_err(|e| self.err(e))?
                 .into_iter()
@@ -732,7 +770,7 @@ impl<S: Source> RobinhoodTools<S> {
             HashMap::new()
         } else {
             self.source
-                .symbols(&needing)
+                .symbols_within(&needing, symbols_read)
                 .await
                 .map_err(|e| self.err(e))?
         };
@@ -743,8 +781,16 @@ impl<S: Source> RobinhoodTools<S> {
             item.id = detailed.then_some(id);
             (key, item)
         };
+        // A row another symbol's is no part of this list, id or no id.
+        let for_symbol = |r: &Value| {
+            symbol.is_none_or(|s| {
+                str_at(r, "instrument")
+                    .and_then(|u| symbols.get(&u).cloned())
+                    .is_some_and(|x| x.eq_ignore_ascii_case(s))
+            })
+        };
         let mut rows: Vec<(PositionKey, ActivityItem)> = Vec::new();
-        for r in &orders {
+        for r in orders.iter().filter(|r| for_symbol(r)) {
             let t = with_id(Transaction::from_json(r, &symbols, false), "an order")?;
             rows.push(keyed(
                 t.id,
@@ -763,7 +809,7 @@ impl<S: Source> RobinhoodTools<S> {
                 },
             ));
         }
-        for r in &paid {
+        for r in paid.iter().filter(|r| for_symbol(r)) {
             let d = with_id(Dividend::from_json(r, &symbols), "a dividend")?;
             rows.push(keyed(
                 d.id,
@@ -843,7 +889,8 @@ impl<S: Source> RobinhoodTools<S> {
         let clock = SystemClock;
         let read = CallRead {
             budget: ReadBudget::start(&clock, self.read_budget),
-            narrow: "type",
+            // With a type named, Robinhood already sends only that type.
+            narrow: kind.is_none().then_some("type"),
         };
         let rows = self
             .source

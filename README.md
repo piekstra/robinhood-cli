@@ -317,7 +317,9 @@ endpoint (the order history is the raw material; see [Tax use](#tax-use)).
 
 Results are concise by default (`response_format: "detailed"` adds ids,
 prices and fees), 25 records a page with a cursor for more, and never larger
-than about 32,000 characters. Accounts are named by nickname or kind
+than about 32,000 characters. A call that reads Robinhood's lists for more than 90 seconds stops
+with an error naming the arguments that shorten it, if any do, and a row Robinhood sends with no
+id fails the call as an upstream error rather than being skipped. Accounts are named by nickname or kind
 (`ira_roth`), with the number's last four characters when two would share a
 name. Descriptions come from Robinhood and other parties; the server tells
 Claude to treat them as data, not instructions.
