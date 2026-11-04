@@ -148,6 +148,8 @@ them behind. Run `rhd auth logout --profile <NAME>` for each login before downgr
 or delete `~/Library/Application Support/piekstra.rhd/browser-profile-*` (on Linux,
 under `$XDG_DATA_HOME` or `~/.local/share`) by hand afterwards.
 
+On Windows, whose Credential Manager holds 2,560 bytes per credential, a longer value is stored across several credentials with the suffix `.pk-split-` and read back whole. After a downgrade, run `rhd auth logout --forget` again from a current build: an older build's logout leaves the parts.
+
 ## The kept browser profile
 
 `auth login --browser` runs Chrome in a profile of its own, so nothing of your
@@ -213,9 +215,12 @@ has held the lock past the wait, `rhd auth logout` and `rhd profiles remove` del
 the session and exit 5 saying so, because a renewal in flight can store it again.
 Run the command again in a minute to settle it.
 
-`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`. The
-server stays up, its callers get auth errors, and **a later login silently
-restores the token holder's access**. Revoke that access separately:
+`rhd auth logout` does not touch `mcp-http-token` and does not stop `rhd mcp --http`.
+`rhd auth logout --forget` removes that token from the keychain too, and says so, but a
+running server keeps the token it started with. Every login shares the token, so a server for
+another login needs `mcp --new-token` at its next start. Either way the server stays up, its
+callers get auth errors, and **a later login silently restores the token holder's access**.
+Revoke that access separately:
 
 - **Invalidate the token:** `rhd mcp --new-token --overwrite`, then restart the
   server (`launchctl kickstart -k gui/$(id -u)/com.piekstra.rhd-mcp-http`). The

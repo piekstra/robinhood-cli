@@ -322,6 +322,9 @@ pub enum LoginOutcome {
 /// Client for the Robinhood private API.
 pub struct Rh {
     http: reqwest::blocking::Client,
+    /// For a POST, whose body can hold a password, a code or a refresh token. reqwest re-sends a
+    /// body on a 307 or 308, so this client follows no redirect to another host.
+    post_http: reqwest::blocking::Client,
     base: String,
     last_request: Cell<Option<Instant>>,
 }
@@ -333,14 +336,18 @@ impl Rh {
         headers.insert("Accept-Language", "en-US,en;q=1".parse().unwrap());
         headers.insert("X-Robinhood-API-Version", API_VERSION.parse().unwrap());
 
-        let http = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .default_headers(headers)
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| CliError::Other(format!("failed to build HTTP client: {e}")))?;
+        let client = |redirects| {
+            reqwest::blocking::Client::builder()
+                .user_agent(USER_AGENT)
+                .default_headers(headers.clone())
+                .timeout(Duration::from_secs(60))
+                .redirect(redirects)
+                .build()
+                .map_err(|e| CliError::Other(format!("failed to build HTTP client: {e}")))
+        };
         Ok(Rh {
-            http,
+            http: client(pk_cli_core::transport::secure_redirects())?,
+            post_http: client(pk_cli_core::transport::same_host_redirects())?,
             base: API_BASE.to_string(),
             last_request: Cell::new(None),
         })
@@ -661,21 +668,21 @@ impl Rh {
     ) -> Result<Value, CliError> {
         self.pace();
         let mut req = self
-            .http
+            .post_http
             .post(format!("{}/oauth2/token/", self.base))
             .form(form);
         if let Some(id) = challenge_id {
             req = req.header("X-ROBINHOOD-CHALLENGE-RESPONSE-ID", id);
         }
-        let resp = req
-            .send()
-            .map_err(|e| CliError::Upstream(format!("contacting Robinhood: {e}")))?;
+        let resp = req.send().map_err(|e| {
+            CliError::Upstream(format!("contacting Robinhood: {}", e.without_url()))
+        })?;
 
         let status = resp.status().as_u16();
         let retry_after = header_value(&resp, "retry-after");
-        let text = resp
-            .text()
-            .map_err(|e| CliError::Upstream(format!("reading login response: {e}")))?;
+        let text = resp.text().map_err(|e| {
+            CliError::Upstream(format!("reading login response: {}", e.without_url()))
+        })?;
         token_answer(status, retry_after.as_deref(), &text, on_html)
     }
 
@@ -736,11 +743,11 @@ impl Rh {
     fn post_json(&self, url: &str, body: &Value) -> Result<Value, CliError> {
         self.pace();
         let resp = self
-            .http
+            .post_http
             .post(url)
             .json(body)
             .send()
-            .map_err(|e| CliError::Upstream(format!("calling {url}: {e}")))?;
+            .map_err(|e| CliError::Upstream(format!("calling {url}: {}", e.without_url())))?;
         json_response(resp)
     }
 
@@ -767,7 +774,7 @@ impl Rh {
         }
         let resp = req
             .send()
-            .map_err(|e| ReadFailure::Upstream(format!("calling {url}: {e}")))?;
+            .map_err(|e| ReadFailure::Upstream(format!("calling {url}: {}", e.without_url())))?;
         read_json(resp)
     }
 
@@ -895,12 +902,10 @@ impl Rh {
         filetype: Option<&str>,
     ) -> Result<Vec<u8>, CliError> {
         self.pace();
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .map_err(|e| CliError::Upstream(format!("downloading {url}: {e}")))?;
+        let resp =
+            self.http.get(url).bearer_auth(token).send().map_err(|e| {
+                CliError::Upstream(format!("downloading {url}: {}", e.without_url()))
+            })?;
         let status = resp.status().as_u16();
         let retry_after = header_value(&resp, "retry-after");
         if status == 429 {
@@ -922,7 +927,7 @@ impl Rh {
         }
         let bytes = resp
             .bytes()
-            .map_err(|e| CliError::Upstream(format!("reading document body: {e}")))?
+            .map_err(|e| CliError::Upstream(format!("reading document body: {}", e.without_url())))?
             .to_vec();
         verify_download(&bytes, filetype)?;
         Ok(bytes)
@@ -1157,9 +1162,9 @@ fn read_json(resp: reqwest::blocking::Response) -> Result<Value, ReadFailure> {
     let status = resp.status().as_u16();
     let url = resp.url().to_string();
     let retry_after = header_value(&resp, "retry-after");
-    let text = resp
-        .text()
-        .map_err(|e| ReadFailure::Upstream(format!("reading response body: {e}")))?;
+    let text = resp.text().map_err(|e| {
+        ReadFailure::Upstream(format!("reading response body: {}", e.without_url()))
+    })?;
     classify(status, &url, retry_after, &text)
 }
 
@@ -1378,6 +1383,37 @@ mod tests {
 
     fn rh() -> Rh {
         Rh::new().expect("client builds")
+    }
+
+    /// reqwest re-sends a body on a 307, so this is what would carry the password away.
+    #[test]
+    fn a_token_post_answered_with_a_307_to_another_host_sends_the_body_nowhere() {
+        use std::io::{Read, Write};
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let there = elsewhere.local_addr().unwrap().port();
+        let portal = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", portal.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut conn, _) = portal.accept().unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = conn.read(&mut chunk);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:{there}/token\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        });
+        let mut rh = rh();
+        rh.base = base;
+        let form = [("password", "dummy-password".to_string())];
+        let e = rh.post_token(&form, None).unwrap_err();
+        assert_eq!(e.exit_code(), 5, "{e}");
+        assert_eq!(
+            elsewhere.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the other host heard nothing"
+        );
     }
 
     #[test]

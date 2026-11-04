@@ -634,6 +634,7 @@ fn reworded(error: CliError, say: impl FnOnce(String) -> String) -> CliError {
         CliError::ConfirmationRequired(m) => CliError::ConfirmationRequired(say(m)),
         CliError::Keychain(m) => CliError::Keychain(say(m)),
         CliError::Other(m) => CliError::Other(say(m)),
+        detailed @ CliError::Detailed(_) => reworded(detailed.into_base(), say),
     }
 }
 
@@ -1096,12 +1097,19 @@ pub fn logout(
 ) -> Result<(), CliError> {
     let creds = CredentialStore::for_binary(config::BIN);
     let note = unconfigured_note(&cfg, profile);
+    let token_removed = std::cell::Cell::new(false);
     let browser = finish_logout(
         store,
         cfg,
         profile,
         forget,
-        |key| delete_item(&creds, profile, key),
+        |key| {
+            if key == pk_cli_mcp::HTTP_TOKEN_ACCOUNT {
+                token_removed.set(creds.delete(key)?);
+                return Ok(());
+            }
+            delete_item(&creds, profile, key)
+        },
         || pk_cli_browser::forget_named_profile(config::BIN, profile),
     )?;
 
@@ -1109,6 +1117,9 @@ pub fn logout(
         eprintln!("{}", logged_out(profile, forget, browser));
         if let Some(note) = note {
             eprintln!("{note}");
+        }
+        if token_removed.get() {
+            eprintln!("{}", pk_cli_mcp::stop_note(config::BIN));
         }
     }
     Ok(())
@@ -1146,6 +1157,12 @@ fn finish_logout(
             delete(&config::password_key(profile)),
         );
         steps.step("the device token", delete(&config::device_key(profile)));
+        // Every login shares this one, and nothing records whether `mcp --new-token` ran, so the
+        // delete is ungated. A server for another login fails closed at its next start.
+        steps.step(
+            "the connector token",
+            delete(pk_cli_mcp::HTTP_TOKEN_ACCOUNT),
+        );
     }
     let browser = steps.browser(forget_browser);
     if forget {
@@ -1209,7 +1226,7 @@ impl TeardownSteps {
     pub(crate) fn failed(&mut self, what: &str, error: CliError) {
         self.remains(what);
         self.reasons
-            .push(inner_message(&error).trim_end_matches('.').to_string());
+            .push(error.message().trim_end_matches('.').to_string());
         self.first.get_or_insert(error);
     }
 
@@ -1270,19 +1287,6 @@ impl TeardownSteps {
             CliError::Keychain(_) => CliError::Other(message),
             first => reworded(first, |_| message),
         })
-    }
-}
-
-/// A failure's own message, without the prefix its `Display` puts on.
-fn inner_message(error: &CliError) -> &str {
-    match error {
-        CliError::Usage(m)
-        | CliError::Auth(m)
-        | CliError::NotFound(m)
-        | CliError::Upstream(m)
-        | CliError::ConfirmationRequired(m)
-        | CliError::Keychain(m)
-        | CliError::Other(m) => m,
     }
 }
 
@@ -2801,7 +2805,8 @@ mod tests {
         assert_eq!(err.exit_code(), 1, "{err}");
         let message = err.to_string();
         for needle in [
-            "the session, the stored password and the device token are cleared",
+            "the session, the stored password, the device token and the connector token are \
+             cleared",
             "the browser profile and this login's config entry remain",
             "symlink",
             "Repair or delete that path",
@@ -2895,13 +2900,14 @@ mod tests {
                 config::pending_key("dummy-one"),
                 config::password_key("dummy-one"),
                 config::device_key("dummy-one"),
+                pk_cli_mcp::HTTP_TOKEN_ACCOUNT.to_string(),
             ]
         );
         assert!(!kept.exists(), "the profile must be removed all the same");
         assert_eq!(err.exit_code(), 1, "{err}");
         let message = err.to_string();
         for needle in [
-            "the stored password, the device token and the browser profile are cleared",
+            "the stored password, the device token, the connector token and the browser profile are cleared",
             "the session and this login's config entry remain",
             "dummy: could not delete",
             "Fix that, then run",
@@ -2994,7 +3000,7 @@ mod tests {
             || pk_cli_browser::forget_named_profile_in(root.path(), config::BIN, "dummy-one"),
         )
         .unwrap_err();
-        assert_eq!(tried, 4);
+        assert_eq!(tried, 5);
         assert!(!kept.exists(), "the profile must be removed all the same");
         assert_eq!(err.exit_code(), 1, "{err}");
         let message = err.to_string();
