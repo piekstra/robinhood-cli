@@ -833,7 +833,19 @@ impl Rh {
         query: &[(&str, String)],
         limit: Option<u32>,
     ) -> Result<Vec<Value>, CliError> {
-        self.paginate_on(&self.base, token, &self.url(path), query, limit)
+        self.paginate_on(&self.base, token, &self.url(path), query, limit, &|| Ok(()))
+    }
+
+    /// [`Rh::paginate`] with no row limit, asking `before_page` before each request, so a tool
+    /// can stop a walk nobody is waiting for.
+    pub fn paginate_checked(
+        &self,
+        token: &str,
+        path: &str,
+        query: &[(&str, String)],
+        before_page: &dyn Fn() -> Result<(), CliError>,
+    ) -> Result<Vec<Value>, CliError> {
+        self.paginate_on(&self.base, token, &self.url(path), query, None, before_page)
     }
 
     /// [`Rh::paginate`] against another Robinhood origin — the `bonfire`
@@ -848,7 +860,7 @@ impl Rh {
         limit: Option<u32>,
     ) -> Result<Vec<Value>, CliError> {
         let url = format!("{}{}", origin.trim_end_matches('/'), path);
-        self.paginate_on(origin, token, &url, query, limit)
+        self.paginate_on(origin, token, &url, query, limit, &|| Ok(()))
     }
 
     fn paginate_on(
@@ -858,6 +870,7 @@ impl Rh {
         first_url: &str,
         query: &[(&str, String)],
         limit: Option<u32>,
+        before_page: &dyn Fn() -> Result<(), CliError>,
     ) -> Result<Vec<Value>, CliError> {
         let cap = limit.map(|l| l as usize).unwrap_or(usize::MAX);
         let mut out = Vec::new();
@@ -866,6 +879,7 @@ impl Rh {
         // A hard ceiling: an unbounded `next` chain is how a read turns into
         // thousands of requests against a rate-limited API.
         for _ in 0..200 {
+            before_page()?;
             let v = self.get(token, &url, if first { query } else { &[] })?;
             first = false;
             match v.get("results").and_then(Value::as_array) {

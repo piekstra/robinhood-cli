@@ -119,22 +119,35 @@ impl Source for Fixtures {
         )
     }
 
-    async fn orders(&self, account: &str, since: &str) -> Result<Vec<Value>, CliError> {
+    async fn orders(
+        &self,
+        account: &str,
+        since: &str,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record(format!("orders:{account}:{since}"))?;
         Ok(owned_by(&self.orders, "account_number", account))
     }
 
-    async fn dividends(&self) -> Result<Vec<Value>, CliError> {
+    async fn dividends(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record("dividends".into())?;
         Ok(self.dividends.clone())
     }
 
-    async fn interest(&self) -> Result<Vec<Value>, CliError> {
+    async fn interest(&self, read: CallRead<'_>) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record("interest".into())?;
         Ok(self.sweeps.clone())
     }
 
-    async fn documents(&self, kind: Option<&str>) -> Result<Vec<Value>, CliError> {
+    async fn documents(
+        &self,
+        kind: Option<&str>,
+        read: CallRead<'_>,
+    ) -> Result<Vec<Value>, CliError> {
+        read.check()?;
         self.record(format!("documents:{}", kind.unwrap_or("all")))?;
         Ok(self
             .documents
@@ -761,4 +774,57 @@ fn the_instructions_name_the_browser_login_and_the_scope() {
         text.contains("options and crypto are not included"),
         "{text}"
     );
+}
+
+/// A row with no id could not hold its place in a position cursor, so it is a changed provider and
+/// not a row left to the count within its day.
+#[test]
+fn an_activity_row_with_no_id_is_an_upstream_error() {
+    for strip in ["orders", "dividends", "sweeps"] {
+        let mut fixtures = Fixtures::new();
+        let rows = match strip {
+            "orders" => &mut fixtures.orders,
+            "dividends" => &mut fixtures.dividends,
+            _ => &mut fixtures.sweeps,
+        };
+        rows.iter_mut().for_each(|row| {
+            row.as_object_mut().unwrap().remove("id");
+        });
+        let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+        let r = call(
+            &t,
+            ACTIVITY_TOOL,
+            json!({"since": "2020-01-01", "until": "2026-12-31"}),
+        );
+        let says = err(&r);
+        assert!(says.starts_with("upstream:"), "{strip}: {says}");
+        assert!(says.contains("no id"), "{strip}: {says}");
+    }
+}
+
+#[test]
+fn a_document_with_no_id_is_an_upstream_error() {
+    let mut fixtures = Fixtures::new();
+    fixtures.documents.iter_mut().for_each(|row| {
+        row.as_object_mut().unwrap().remove("id");
+    });
+    let t = RobinhoodTools::new(fixtures, Ok("default".into())).on(summer);
+    let r = call(&t, DOCUMENTS_TOOL, json!({}));
+    let says = err(&r);
+    assert!(says.starts_with("upstream:"), "{says}");
+    assert!(says.contains("no id"), "{says}");
+}
+
+/// A walk past its time says what shortens it, rather than answering at the server's limit with
+/// nobody told why.
+#[test]
+fn a_read_past_its_budget_asks_for_a_narrower_call() {
+    let t = tools().with_read_budget(std::time::Duration::ZERO);
+    let r = call(&t, ACTIVITY_TOOL, json!({"since": "2026-01-01"}));
+    let says = err(&r);
+    assert!(says.starts_with("usage:"), "{says}");
+    assert!(says.contains("since/until, account or type"), "{says}");
+    let r = call(&t, DOCUMENTS_TOOL, json!({}));
+    let says = err(&r);
+    assert!(says.contains("narrow type"), "{says}");
 }
